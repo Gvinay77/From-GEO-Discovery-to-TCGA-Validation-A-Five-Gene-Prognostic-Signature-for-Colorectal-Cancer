@@ -1,0 +1,362 @@
+---
+title: "CRC Immune Phenotype and Prognostic Signature Pipeline"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: cosmo
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+options(stringsAsFactors = FALSE)
+
+dir.create("data", showWarnings = FALSE)
+dir.create("data/tcga", showWarnings = FALSE)
+dir.create("data/geo", showWarnings = FALSE)
+dir.create("results", showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+```
+
+# 1. Load packages
+
+```{r packages}
+needed_cran <- c(
+  "dplyr", "ggplot2", "tibble", "stringr", "pheatmap",
+  "reshape2", "data.table", "survival", "survminer",
+  "glmnet", "readr"
+)
+
+for (pkg in needed_cran) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+
+needed_bioc <- c(
+  "TCGAbiolinks", "SummarizedExperiment", "GEOquery", "Biobase",
+  "limma", "edgeR", "DESeq2", "clusterProfiler", "org.Hs.eg.db",
+  "enrichplot", "GSVA"
+)
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+for (pkg in needed_bioc) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, ask = FALSE, update = FALSE)
+  }
+}
+
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(stringr)
+library(pheatmap)
+library(reshape2)
+library(data.table)
+library(survival)
+library(survminer)
+library(glmnet)
+library(readr)
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(GEOquery)
+library(Biobase)
+library(limma)
+library(edgeR)
+library(DESeq2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(GSVA)
+```
+
+# 2. Notes before running
+
+This report assumes you already generated or downloaded the core CRC expression and clinical data.
+
+Required objects/files for the survival-signature part:
+
+- `results/DE_with_symbols.csv`
+- expression matrix with **gene symbols as rownames** and **samples as columns**
+- survival table with columns:
+  - `sample`
+  - `time`
+  - `status`
+
+If you already saved the expression and survival objects before, this report will load them automatically.
+
+# 3. Load saved objects if available
+
+```{r load-saved}
+has_expr <- file.exists("results/crc_tpm_log_gene.rds")
+has_surv <- file.exists("results/surv_df2.rds")
+
+if (has_expr) crc_tpm_log_gene <- readRDS("results/crc_tpm_log_gene.rds")
+if (has_surv) surv_df2 <- readRDS("results/surv_df2.rds")
+
+cat("Expression object found:", has_expr, "\n")
+cat("Survival object found:", has_surv, "\n")
+```
+
+# 4. Optional: create expression and survival objects
+
+Put your earlier code here if you need to rebuild `crc_tpm_log_gene` and `surv_df2`.
+
+The final required format should be:
+
+- `crc_tpm_log_gene`: matrix/data.frame, genes x samples
+- `rownames(crc_tpm_log_gene)`: gene symbols
+- `colnames(crc_tpm_log_gene)`: sample IDs
+- `surv_df2`: data.frame with `sample`, `time`, `status`
+
+```{r check-required}
+if (!file.exists("results/DE_with_symbols.csv")) {
+  stop("Missing file: results/DE_with_symbols.csv")
+}
+
+de_sym <- read.csv("results/DE_with_symbols.csv", stringsAsFactors = FALSE)
+
+req_cols <- c("symbol", "adj.P.Val", "logFC")
+missing_cols <- setdiff(req_cols, colnames(de_sym))
+if (length(missing_cols) > 0) {
+  stop("DE_with_symbols.csv is missing columns: ", paste(missing_cols, collapse = ", "))
+}
+
+if (!exists("crc_tpm_log_gene")) {
+  stop("Object 'crc_tpm_log_gene' not found. Recreate it or load results/crc_tpm_log_gene.rds")
+}
+
+if (!exists("surv_df2")) {
+  stop("Object 'surv_df2' not found. Recreate it or load results/surv_df2.rds")
+}
+```
+
+# 5. Save key objects immediately
+
+This prevents errors after an R session restart.
+
+```{r save-core}
+saveRDS(crc_tpm_log_gene, "results/crc_tpm_log_gene.rds")
+saveRDS(surv_df2, "results/surv_df2.rds")
+```
+
+# 6. Create strict DE gene list
+
+```{r strict-de}
+sig_strict_genes <- unique(
+  na.omit(de_sym$symbol[de_sym$adj.P.Val < 0.01 & abs(de_sym$logFC) > 1.5])
+)
+
+cat("Strict genes (symbols):", length(sig_strict_genes), "\n")
+```
+
+# 7. Match genes and samples
+
+```{r match-data}
+genes_for_cox <- intersect(sig_strict_genes, rownames(crc_tpm_log_gene))
+cat("Strict genes present in expr:", length(genes_for_cox), "\n")
+
+if (length(genes_for_cox) == 0) {
+  stop("No strict DE genes are present in the expression matrix.")
+}
+
+req_surv <- c("sample", "time", "status")
+missing_surv <- setdiff(req_surv, colnames(surv_df2))
+if (length(missing_surv) > 0) {
+  stop("surv_df2 is missing columns: ", paste(missing_surv, collapse = ", "))
+}
+
+common_samples <- intersect(surv_df2$sample, colnames(crc_tpm_log_gene))
+cat("Matched samples:", length(common_samples), "\n")
+
+if (length(common_samples) == 0) {
+  stop("No matching samples between surv_df2 and expression matrix.")
+}
+
+surv_df2_use <- surv_df2 %>%
+  filter(sample %in% common_samples) %>%
+  distinct(sample, .keep_all = TRUE) %>%
+  filter(!is.na(time), !is.na(status))
+
+surv_df2_use$time <- as.numeric(surv_df2_use$time)
+surv_df2_use$status <- as.numeric(surv_df2_use$status)
+
+surv_df2_use <- surv_df2_use %>%
+  filter(!is.na(time), !is.na(status), time > 0)
+
+cat("Samples after filtering:", nrow(surv_df2_use), "\n")
+table(surv_df2_use$status)
+summary(surv_df2_use$time)
+```
+
+# 8. Build expression matrix for Cox analysis
+
+```{r build-x}
+X_all2 <- t(crc_tpm_log_gene[genes_for_cox, surv_df2_use$sample, drop = FALSE])
+X_all2 <- as.matrix(X_all2)
+
+keep_no_na <- apply(X_all2, 2, function(z) all(!is.na(z)))
+X_all2 <- X_all2[, keep_no_na, drop = FALSE]
+
+sdv <- apply(X_all2, 2, sd)
+X_all2 <- X_all2[, sdv > 0, drop = FALSE]
+
+cat("Genes after NA/zero-variance removal:", ncol(X_all2), "\n")
+
+if (ncol(X_all2) == 0) {
+  stop("No genes left after filtering.")
+}
+```
+
+# 9. Univariate Cox ranking
+
+```{r univariate-cox}
+y <- Surv(surv_df2_use$time, surv_df2_use$status)
+
+cox_p <- apply(X_all2, 2, function(x) {
+  fit <- tryCatch(coxph(y ~ x), error = function(e) NULL)
+  if (is.null(fit)) return(NA_real_)
+  out <- tryCatch(summary(fit)$coef[1, "Pr(>|z|)"], error = function(e) NA_real_)
+  as.numeric(out)
+})
+
+cox_res <- data.frame(
+  gene = names(cox_p),
+  p = as.numeric(cox_p),
+  stringsAsFactors = FALSE
+) %>%
+  filter(!is.na(p), is.finite(p)) %>%
+  arrange(p)
+
+write.csv(cox_res, "results/univariate_cox_ranked_p.csv", row.names = FALSE)
+saveRDS(cox_res, "results/cox_res.rds")
+
+head(cox_res, 10)
+```
+
+# 10. LASSO Cox model
+
+```{r lasso-fit}
+topN <- min(300, nrow(cox_res))
+lasso_genes <- head(cox_res$gene, topN)
+X_lasso <- X_all2[, lasso_genes, drop = FALSE]
+
+cat("Genes entering LASSO:", ncol(X_lasso), "\n")
+
+saveRDS(X_lasso, "results/X_lasso.rds")
+
+set.seed(1)
+cvfit <- cv.glmnet(
+  x = X_lasso,
+  y = y,
+  family = "cox",
+  alpha = 1,
+  nfolds = 10
+)
+
+saveRDS(cvfit, "results/cvfit_custom.rds")
+plot(cvfit)
+```
+
+# 11. Choose lambda for a 13-gene signature
+
+```{r choose-lambda}
+beta <- as.matrix(coef(cvfit$glmnet.fit))
+n_genes <- colSums(beta != 0)
+
+target <- 13
+exact_idx <- which(n_genes == target)
+
+if (length(exact_idx) > 0) {
+  idx <- exact_idx[1]
+} else {
+  idx <- which.min(abs(n_genes - target))
+}
+
+lambda_custom <- cvfit$glmnet.fit$lambda[idx]
+coef_custom <- coef(cvfit$glmnet.fit, s = lambda_custom)
+
+nz <- which(as.numeric(coef_custom) != 0)
+
+signature_custom <- data.frame(
+  gene = rownames(coef_custom)[nz],
+  coef = as.numeric(coef_custom)[nz],
+  stringsAsFactors = FALSE
+) %>%
+  arrange(desc(abs(coef)))
+
+cat("Final signature size (custom):", nrow(signature_custom), "\n")
+signature_custom
+```
+
+# 12. Save signature
+
+```{r save-signature}
+write.csv(signature_custom, "results/lasso_signature_lambda_custom.csv", row.names = FALSE)
+saveRDS(signature_custom, "results/signature_custom.rds")
+```
+
+# 13. Compute risk score
+
+```{r risk-score}
+sig_genes <- intersect(signature_custom$gene, rownames(crc_tpm_log_gene))
+cat("Signature genes found in expression:", length(sig_genes), "\n")
+
+X_sig <- t(crc_tpm_log_gene[sig_genes, surv_df2_use$sample, drop = FALSE])
+X_sig <- as.matrix(X_sig)
+
+coef_df <- signature_custom[match(colnames(X_sig), signature_custom$gene), ]
+beta_sig <- coef_df$coef
+
+risk_score <- as.numeric(X_sig %*% beta_sig)
+
+surv_sig <- surv_df2_use
+surv_sig$risk_score <- risk_score
+surv_sig$risk_group <- ifelse(
+  surv_sig$risk_score >= median(surv_sig$risk_score, na.rm = TRUE),
+  "High", "Low"
+)
+
+write.csv(surv_sig, "results/risk_scores.csv", row.names = FALSE)
+
+head(surv_sig)
+```
+
+# 14. Kaplan-Meier analysis
+
+```{r km-plot, fig.width=8, fig.height=6}
+fit_km <- survfit(Surv(time, status) ~ risk_group, data = surv_sig)
+
+p_km <- ggsurvplot(
+  fit_km,
+  data = surv_sig,
+  pval = TRUE,
+  risk.table = TRUE,
+  conf.int = FALSE,
+  title = "Kaplan-Meier Survival by Risk Group"
+)
+
+p_km
+```
+
+# 15. Optional: Cox model using risk score
+
+```{r cox-risk}
+cox_risk <- coxph(Surv(time, status) ~ risk_score, data = surv_sig)
+summary(cox_risk)
+```
+
+# 16. Session info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,1462 @@
+```{r}
+dir.create("data", showWarnings = FALSE)
+dir.create("data/tcga", showWarnings = FALSE)
+dir.create("data/geo", showWarnings = FALSE)
+dir.create("results", showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+```
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+# Core Bioconductor packages
+BiocManager::install(c(
+  "TCGAbiolinks",
+  "SummarizedExperiment",
+  "GEOquery",
+  "Biobase",
+  "limma",
+  "edgeR",
+  "DESeq2",
+  "glmnet",
+  "survival",
+  "survminer",
+  "clusterProfiler",
+  "org.Hs.eg.db",
+  "enrichplot",
+  "GSVA",
+  "estimate"
+), ask = FALSE, update = FALSE)
+
+# CRAN packages
+install.packages(c(
+  "tidyverse",
+  "ggplot2",
+  "dplyr",
+  "tibble",
+  "stringr",
+  "pheatmap",
+  "reshape2",
+  "data.table",
+  "timeROC",
+  "caret",
+  "readr"
+))
+```
+
+
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(GEOquery)
+library(Biobase)
+library(limma)
+library(edgeR)
+library(DESeq2)
+library(glmnet)
+library(survival)
+library(survminer)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(GSVA)
+library(estimate)
+
+library(tidyverse)
+library(pheatmap)
+library(timeROC)
+library(caret)
+```
+
+```{r}
+library(TCGAbiolinks)
+```
+```{r}
+exists("GDCquery")
+```
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+
+dir.create("data/tcga", recursive = TRUE, showWarnings = FALSE)
+
+# --- TCGA-COAD (STAR counts) ---
+query_coad <- GDCquery(
+  project = "TCGA-COAD",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+
+GDCdownload(query_coad, directory = "data/tcga")
+coad_se <- GDCprepare(query_coad, directory = "data/tcga")
+
+saveRDS(coad_se, file = "data/tcga/TCGA-COAD_se.rds")
+saveRDS(assay(coad_se), file = "data/tcga/TCGA-COAD_counts.rds")
+
+dim(assay(coad_se))
+```
+
+```{r}
+dir.create("data/tcga", recursive = TRUE, showWarnings = FALSE)
+
+# Raw counts (use this for DESeq2/edgeR/voom)
+coad_counts <- assay(coad_se, "unstranded")
+
+# TPM (good for immune scoring / ssGSEA)
+coad_tpm <- assay(coad_se, "tpm_unstrand")
+
+saveRDS(coad_se,     "data/tcga/TCGA-COAD_se.rds")
+saveRDS(coad_counts, "data/tcga/TCGA-COAD_counts_unstranded.rds")
+saveRDS(coad_tpm,    "data/tcga/TCGA-COAD_tpm_unstrand.rds")
+
+dim(coad_counts)
+dim(coad_tpm)
+```
+
+
+```{r}
+query_read <- GDCquery(
+  project = "TCGA-READ",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+
+GDCdownload(query_read, directory = "data/tcga")
+read_se <- GDCprepare(query_read, directory = "data/tcga")
+
+# Save counts + TPM
+read_counts <- assay(read_se, "unstranded")
+read_tpm    <- assay(read_se, "tpm_unstrand")
+
+saveRDS(read_se,     "data/tcga/TCGA-READ_se.rds")
+saveRDS(read_counts, "data/tcga/TCGA-READ_counts_unstranded.rds")
+saveRDS(read_tpm,    "data/tcga/TCGA-READ_tpm_unstrand.rds")
+
+dim(read_counts)
+```
+
+```{r}
+# Common genes only
+common_genes <- intersect(rownames(coad_counts), rownames(read_counts))
+
+crc_counts <- cbind(coad_counts[common_genes, ], read_counts[common_genes, ])
+crc_tpm    <- cbind(coad_tpm[common_genes, ],    read_tpm[common_genes, ])
+
+saveRDS(crc_counts, "data/tcga/TCGA_CRC_counts_merged.rds")
+saveRDS(crc_tpm,    "data/tcga/TCGA_CRC_tpm_merged.rds")
+
+dim(crc_counts)
+```
+```{r}
+library(SummarizedExperiment)
+
+dir.create("data/tcga", recursive = TRUE, showWarnings = FALSE)
+
+# ===== 1) Extract counts + TPM from both cohorts =====
+coad_counts <- assay(coad_se, "unstranded")
+coad_tpm    <- assay(coad_se, "tpm_unstrand")
+
+read_counts <- assay(read_se, "unstranded")
+read_tpm    <- assay(read_se, "tpm_unstrand")
+
+# ===== 2) Save individual cohort objects =====
+saveRDS(coad_se,     "data/tcga/TCGA-COAD_se.rds")
+saveRDS(coad_counts, "data/tcga/TCGA-COAD_counts_unstranded.rds")
+saveRDS(coad_tpm,    "data/tcga/TCGA-COAD_tpm_unstrand.rds")
+
+saveRDS(read_se,     "data/tcga/TCGA-READ_se.rds")
+saveRDS(read_counts, "data/tcga/TCGA-READ_counts_unstranded.rds")
+saveRDS(read_tpm,    "data/tcga/TCGA-READ_tpm_unstrand.rds")
+
+# ===== 3) Merge COAD + READ by common genes =====
+common_genes <- intersect(rownames(coad_counts), rownames(read_counts))
+
+crc_counts <- cbind(
+  coad_counts[common_genes, ],
+  read_counts[common_genes, ]
+)
+
+crc_tpm <- cbind(
+  coad_tpm[common_genes, ],
+  read_tpm[common_genes, ]
+)
+
+saveRDS(crc_counts, "data/tcga/TCGA_CRC_counts_merged.rds")
+saveRDS(crc_tpm,    "data/tcga/TCGA_CRC_tpm_merged.rds")
+
+cat("Merged CRC counts dim:", dim(crc_counts), "\n")
+cat("Merged CRC TPM dim:", dim(crc_tpm), "\n")
+
+# ===== 4) Create a sample->patient barcode map (needed for clinical merge) =====
+sample_barcodes <- colnames(crc_counts)
+patient_barcodes <- substr(sample_barcodes, 1, 12)
+
+sample_map <- data.frame(
+  sample_barcode = sample_barcodes,
+  patient_barcode = patient_barcodes,
+  stringsAsFactors = FALSE
+)
+
+saveRDS(sample_map, "data/tcga/TCGA_CRC_sample_patient_map.rds")
+head(sample_map)
+```
+```{r}
+library(SummarizedExperiment)
+library(dplyr)
+library(tibble)
+
+# Use the rowData from one of your prepared objects (coad_se/read_se have it)
+# This has Ensembl IDs and gene_name columns.
+row_anno <- as.data.frame(rowData(coad_se))
+
+# Common columns in TCGAbiolinks rowData: gene_id and gene_name
+# gene_id often includes version: ENSG... .xx
+head(row_anno[, c("gene_id", "gene_name")])
+
+# Build mapping: Ensembl (no version) -> gene symbol
+ens_id <- gsub("\\..*$", "", row_anno$gene_id)
+symb   <- row_anno$gene_name
+
+map_df <- data.frame(
+  ensembl = ens_id,
+  symbol = symb,
+  stringsAsFactors = FALSE
+) %>%
+  distinct(ensembl, .keep_all = TRUE) %>%
+  filter(!is.na(symbol), symbol != "")
+
+# Apply mapping to your merged TPM matrix
+crc_tpm_log <- log2(crc_tpm + 1)
+
+ens_rows <- gsub("\\..*$", "", rownames(crc_tpm_log))
+m <- match(ens_rows, map_df$ensembl)
+
+# Keep only mapped genes
+crc_tpm_log_mapped <- crc_tpm_log[!is.na(m), ]
+new_symbols <- map_df$symbol[m[!is.na(m)]]
+rownames(crc_tpm_log_mapped) <- new_symbols
+
+# If multiple Ensembl map to same symbol, collapse by mean
+crc_tpm_log_gene <- rowsum(crc_tpm_log_mapped, group = rownames(crc_tpm_log_mapped))
+
+cat("Before mapping:", nrow(crc_tpm_log), "genes\n")
+cat("After mapping+collapse:", nrow(crc_tpm_log_gene), "unique gene symbols\n")
+
+saveRDS(crc_tpm_log_gene, "data/tcga/TCGA_CRC_tpm_log2_geneSymbol.rds")
+```
+
+
+```{r}
+library(dplyr)
+
+# Use rowData from coad_se (already in your workspace)
+row_anno <- as.data.frame(rowData(coad_se))[, c("gene_id", "gene_name")]
+
+# Remove Ensembl version suffix (.15, .6, etc.)
+row_anno$ensembl <- sub("\\..*$", "", row_anno$gene_id)
+
+map_df <- row_anno %>%
+  select(ensembl, symbol = gene_name) %>%
+  distinct(ensembl, .keep_all = TRUE) %>%
+  filter(!is.na(symbol), symbol != "")
+
+# Prepare expression (log2(TPM+1))
+crc_tpm_log <- log2(crc_tpm + 1)
+
+# Remove version from expression rownames too
+ens_rows <- sub("\\..*$", "", rownames(crc_tpm_log))
+
+# Match expression rows to mapping
+m <- match(ens_rows, map_df$ensembl)
+
+# Keep only rows that map to a symbol
+crc_tpm_log_mapped <- crc_tpm_log[!is.na(m), , drop = FALSE]
+rownames(crc_tpm_log_mapped) <- map_df$symbol[m[!is.na(m)]]
+
+# Collapse duplicate symbols by mean
+crc_tpm_log_gene <- rowsum(crc_tpm_log_mapped, group = rownames(crc_tpm_log_mapped))
+
+cat("Genes before:", nrow(crc_tpm_log), "\n")
+cat("Genes after mapping+collapse:", nrow(crc_tpm_log_gene), "\n")
+
+dir.create("data/tcga", recursive = TRUE, showWarnings = FALSE)
+saveRDS(crc_tpm_log_gene, "data/tcga/TCGA_CRC_tpm_log2_geneSymbol.rds")
+```
+```{r}
+library(GSVA)
+
+crc_tpm_log_gene <- readRDS("data/tcga/TCGA_CRC_tpm_log2_geneSymbol.rds")
+
+immune_genes <- c("PTPRC","CD3D","CD3E","CD8A","CD8B","GZMB","PRF1","CXCL9","CXCL10","IFNG")
+stromal_genes <- c("COL1A1","COL1A2","COL3A1","COL5A1","COL5A2","FN1","VCAN","SPARC","MMP2","MMP9","CXCL12","FAP")
+
+cat("Immune genes matched:", sum(immune_genes %in% rownames(crc_tpm_log_gene)), "/", length(immune_genes), "\n")
+cat("Stromal genes matched:", sum(stromal_genes %in% rownames(crc_tpm_log_gene)), "/", length(stromal_genes), "\n")
+
+gene_sets <- list(
+  Immune_Infiltration = intersect(immune_genes, rownames(crc_tpm_log_gene)),
+  Stromal_ECM_Barrier = intersect(stromal_genes, rownames(crc_tpm_log_gene))
+)
+
+param <- ssgseaParam(expr = crc_tpm_log_gene, geneSets = gene_sets)
+scores <- gsva(param)
+scores_mat <- as.matrix(scores)
+
+immune_score  <- as.numeric(scores_mat["Immune_Infiltration", ])
+stromal_score <- as.numeric(scores_mat["Stromal_ECM_Barrier", ])
+
+names(immune_score)  <- colnames(crc_tpm_log_gene)
+names(stromal_score) <- colnames(crc_tpm_log_gene)
+
+# Quartile thresholds
+immune_low_cut   <- quantile(immune_score, 0.25, na.rm = TRUE)
+immune_high_cut  <- quantile(immune_score, 0.75, na.rm = TRUE)
+stromal_low_cut  <- quantile(stromal_score, 0.25, na.rm = TRUE)
+stromal_high_cut <- quantile(stromal_score, 0.75, na.rm = TRUE)
+
+phenotype <- rep("Other", length(immune_score))
+names(phenotype) <- names(immune_score)
+
+phenotype[immune_score <= immune_low_cut  & stromal_score >= stromal_high_cut] <- "Immune_Excluded"
+phenotype[immune_score >= immune_high_cut & stromal_score <= stromal_low_cut ] <- "Immune_Inflamed"
+
+print(table(phenotype))
+
+saveRDS(immune_score,  "data/tcga/immune_score_ssgsea.rds")
+saveRDS(stromal_score, "data/tcga/stromal_score_ssgsea.rds")
+saveRDS(phenotype,     "data/tcga/immune_exclusion_phenotype.rds")
+```
+
+```{r}
+library(edgeR)
+library(limma)
+
+# Ensure crc_counts is loaded
+# crc_counts <- readRDS("data/tcga/TCGA_CRC_counts_merged.rds")
+
+keep_samples <- phenotype %in% c("Immune_Excluded", "Immune_Inflamed")
+table(phenotype[keep_samples])
+
+counts_sub <- crc_counts[, keep_samples]
+group <- factor(phenotype[keep_samples], levels = c("Immune_Inflamed", "Immune_Excluded"))
+
+dge <- DGEList(counts = counts_sub)
+keep_genes <- filterByExpr(dge, group = group)
+dge <- dge[keep_genes, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge)
+
+design <- model.matrix(~ group)
+v <- voom(dge, design, plot = TRUE)
+
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+
+de <- topTable(fit, coef = "groupImmune_Excluded", number = Inf, adjust.method = "BH")
+de$ensembl_id <- rownames(de)
+
+dir.create("results", showWarnings = FALSE)
+write.csv(de, "results/DE_ImmuneExcluded_vs_Inflamed_limma_voom.csv", row.names = FALSE)
+
+sig <- subset(de, adj.P.Val < 0.05 & abs(logFC) > 1)
+write.csv(sig, "results/DE_SIG_ImmuneExcluded_vs_Inflamed.csv", row.names = FALSE)
+
+cat("Significant genes:", nrow(sig), "\n")
+head(sig, 10)
+```
+```{r}
+# Build mapping again
+row_anno <- as.data.frame(rowData(coad_se))[, c("gene_id", "gene_name")]
+row_anno$ensembl <- sub("\\..*$", "", row_anno$gene_id)
+
+map_df <- row_anno[, c("ensembl", "gene_name")]
+colnames(map_df) <- c("ensembl", "symbol")
+
+# Remove version from DE Ensembl
+de$ensembl_clean <- sub("\\..*$", "", de$ensembl_id)
+
+de <- merge(de, map_df, by.x = "ensembl_clean", by.y = "ensembl", all.x = TRUE)
+
+write.csv(de, "results/DE_with_symbols.csv", row.names = FALSE)
+
+head(de[, c("symbol","logFC","adj.P.Val")], 10)
+```
+```{r}
+sig_strict <- subset(de, adj.P.Val < 0.01 & abs(logFC) > 1.5)
+cat("Strict significant genes:", nrow(sig_strict), "\n")
+```
+
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Use significant genes only
+sig_genes <- unique(na.omit(de$symbol[de$adj.P.Val < 0.05 & abs(de$logFC) > 1]))
+
+# Convert gene symbols to Entrez IDs
+entrez_ids <- bitr(sig_genes,
+                   fromType = "SYMBOL",
+                   toType = "ENTREZID",
+                   OrgDb = org.Hs.eg.db)
+
+# GO enrichment
+ego <- enrichGO(gene = entrez_ids$ENTREZID,
+                OrgDb = org.Hs.eg.db,
+                ont = "BP",
+                pAdjustMethod = "BH",
+                qvalueCutoff = 0.05)
+
+# KEGG enrichment
+ekegg <- enrichKEGG(gene = entrez_ids$ENTREZID,
+                    organism = "hsa",
+                    pAdjustMethod = "BH",
+                    qvalueCutoff = 0.05)
+
+dotplot(ego, showCategory = 15)
+dotplot(ekegg, showCategory = 15)
+```
+
+```{r}
+library(TCGAbiolinks)
+library(dplyr)
+
+# 1) Clinical (COAD + READ)
+clinical_coad <- GDCquery_clinic("TCGA-COAD", type = "clinical")
+clinical_read <- GDCquery_clinic("TCGA-READ", type = "clinical")
+clinical_all <- bind_rows(clinical_coad, clinical_read)
+
+# 2) Create OS time + event
+clinical_all <- clinical_all %>%
+  transmute(
+    patient = submitter_id,
+    vital_status = vital_status,
+    days_to_death = suppressWarnings(as.numeric(days_to_death)),
+    days_to_last_follow_up = suppressWarnings(as.numeric(days_to_last_follow_up)),
+    time = ifelse(!is.na(days_to_death), days_to_death, days_to_last_follow_up),
+    status = ifelse(vital_status == "Dead", 1, 0)
+  ) %>%
+  filter(!is.na(time))
+
+# 3) Make sample->patient table from your expression matrix
+# Ensure crc_tpm_log_gene exists; if not load it:
+# crc_tpm_log_gene <- readRDS("data/tcga/TCGA_CRC_tpm_log2_geneSymbol.rds")
+
+expr_samples <- colnames(crc_tpm_log_gene)
+
+expr_meta <- data.frame(
+  sample = expr_samples,
+  patient = substr(expr_samples, 1, 12),
+  stringsAsFactors = FALSE
+)
+
+# 4) Merge expression sample list with clinical survival
+surv_df <- inner_join(expr_meta, clinical_all, by = "patient")
+
+cat("Samples with survival:", nrow(surv_df), "\n")
+table(surv_df$status)
+summary(surv_df$time)
+
+head(surv_df)
+```
+```{r}
+library(survival)
+
+dir.create("results", showWarnings = FALSE)
+
+genes_for_cox <- intersect(sig_strict$symbol, rownames(crc_tpm_log_gene))
+cat("Genes available for Cox:", length(genes_for_cox), "\n")
+
+# Expression matrix: samples x genes (so glmnet works later)
+X_all <- t(crc_tpm_log_gene[genes_for_cox, surv_df$sample, drop = FALSE])
+X_all <- as.matrix(X_all)
+
+# Remove any columns with zero variance
+sd_vec <- apply(X_all, 2, sd, na.rm = TRUE)
+X_all <- X_all[, sd_vec > 0, drop = FALSE]
+genes_for_cox <- colnames(X_all)
+
+cox_list <- vector("list", length(genes_for_cox))
+names(cox_list) <- genes_for_cox
+
+for (g in genes_for_cox) {
+  x <- X_all[, g]
+  fit <- tryCatch(coxph(Surv(time, status) ~ x, data = surv_df), error = function(e) NULL)
+  if (!is.null(fit)) {
+    s <- summary(fit)
+    cox_list[[g]] <- data.frame(
+      gene = g,
+      HR = s$coef[1, "exp(coef)"],
+      p  = s$coef[1, "Pr(>|z|)"],
+      stringsAsFactors = FALSE
+    )
+  } else {
+    cox_list[[g]] <- NULL
+  }
+}
+
+cox_res <- do.call(rbind, cox_list)
+cox_res$adj_p <- p.adjust(cox_res$p, method = "BH")
+cox_res <- cox_res[order(cox_res$adj_p), ]
+
+sig_cox <- subset(cox_res, adj_p < 0.05)
+
+cat("Cox significant genes (FDR<0.05):", nrow(sig_cox), "\n")
+
+write.csv(cox_res, "results/univariate_cox_all.csv", row.names = FALSE)
+write.csv(sig_cox, "results/univariate_cox_significant.csv", row.names = FALSE)
+
+head(sig_cox, 10)
+```
+
+```{r}
+library(survival)
+
+dir.create("results", showWarnings = FALSE)
+
+genes_for_cox <- intersect(sig_strict$symbol, rownames(crc_tpm_log_gene))
+cat("Genes available for Cox:", length(genes_for_cox), "\n")
+
+# Expression matrix: samples x genes (so glmnet works later)
+X_all <- t(crc_tpm_log_gene[genes_for_cox, surv_df$sample, drop = FALSE])
+X_all <- as.matrix(X_all)
+
+# Remove any columns with zero variance
+sd_vec <- apply(X_all, 2, sd, na.rm = TRUE)
+X_all <- X_all[, sd_vec > 0, drop = FALSE]
+genes_for_cox <- colnames(X_all)
+
+cox_list <- vector("list", length(genes_for_cox))
+names(cox_list) <- genes_for_cox
+
+for (g in genes_for_cox) {
+  x <- X_all[, g]
+  fit <- tryCatch(coxph(Surv(time, status) ~ x, data = surv_df), error = function(e) NULL)
+  if (!is.null(fit)) {
+    s <- summary(fit)
+    cox_list[[g]] <- data.frame(
+      gene = g,
+      HR = s$coef[1, "exp(coef)"],
+      p  = s$coef[1, "Pr(>|z|)"],
+      stringsAsFactors = FALSE
+    )
+  } else {
+    cox_list[[g]] <- NULL
+  }
+}
+
+cox_res <- do.call(rbind, cox_list)
+cox_res$adj_p <- p.adjust(cox_res$p, method = "BH")
+cox_res <- cox_res[order(cox_res$adj_p), ]
+
+sig_cox <- subset(cox_res, adj_p < 0.05)
+
+cat("Cox significant genes (FDR<0.05):", nrow(sig_cox), "\n")
+
+write.csv(cox_res, "results/univariate_cox_all.csv", row.names = FALSE)
+write.csv(sig_cox, "results/univariate_cox_significant.csv", row.names = FALSE)
+
+head(sig_cox, 10)
+```
+```{r}
+library(survival)
+
+genes_for_cox <- intersect(sig_strict$symbol, rownames(crc_tpm_log_gene))
+X_all <- t(crc_tpm_log_gene[genes_for_cox, surv_df$sample, drop = FALSE])
+X_all <- as.matrix(X_all)
+
+# remove zero-variance genes
+sd_vec <- apply(X_all, 2, sd, na.rm = TRUE)
+X_all <- X_all[, sd_vec > 0, drop = FALSE]
+genes_for_cox <- colnames(X_all)
+
+cox_list <- vector("list", length(genes_for_cox))
+names(cox_list) <- genes_for_cox
+
+for (g in genes_for_cox) {
+  x <- X_all[, g]
+  fit <- tryCatch(coxph(Surv(time, status) ~ x, data = surv_df), error = function(e) NULL)
+  if (!is.null(fit)) {
+    s <- summary(fit)
+    cox_list[[g]] <- data.frame(
+      gene = g,
+      HR = s$coef[1, "exp(coef)"],
+      p  = s$coef[1, "Pr(>|z|)"],
+      stringsAsFactors = FALSE
+    )
+  } else {
+    cox_list[[g]] <- NULL
+  }
+}
+
+cox_res <- do.call(rbind, cox_list)
+cox_res <- cox_res[order(cox_res$p), ]
+
+write.csv(cox_res, "results/univariate_cox_all_p.csv", row.names = FALSE)
+
+head(cox_res, 10)
+```
+
+```{r}
+topN <- 200
+lasso_genes <- head(cox_res$gene, topN)
+
+cat("Genes entering LASSO:", length(lasso_genes), "\n")
+```
+
+```{r}
+# Remove non-positive follow-up times (glmnet Cox requirement)
+surv_df2 <- surv_df[surv_df$time > 0 & !is.na(surv_df$time) & !is.na(surv_df$status), ]
+
+cat("Samples before:", nrow(surv_df), "\n")
+cat("Samples after removing time<=0:", nrow(surv_df2), "\n")
+table(surv_df2$status)
+summary(surv_df2$time)
+```
+```{r}
+# Rebuild X_all using filtered samples
+genes_for_cox <- intersect(sig_strict$symbol, rownames(crc_tpm_log_gene))
+
+X_all2 <- t(crc_tpm_log_gene[genes_for_cox, surv_df2$sample, drop = FALSE])
+X_all2 <- as.matrix(X_all2)
+
+# Remove zero-variance genes
+sd_vec <- apply(X_all2, 2, sd, na.rm = TRUE)
+X_all2 <- X_all2[, sd_vec > 0, drop = FALSE]
+
+# Use your top 200 Cox genes (already computed in cox_res)
+topN <- 200
+lasso_genes <- head(cox_res$gene, topN)
+lasso_genes <- intersect(lasso_genes, colnames(X_all2))
+
+X_lasso <- X_all2[, lasso_genes, drop = FALSE]
+y <- Surv(surv_df2$time, surv_df2$status)
+
+library(glmnet)
+set.seed(1)
+cvfit <- cv.glmnet(
+  x = X_lasso,
+  y = y,
+  family = "cox",
+  alpha = 1,
+  nfolds = 10
+)
+
+plot(cvfit)
+
+coef_mat <- coef(cvfit, s = "lambda.1se")
+idx <- which(as.numeric(coef_mat) != 0)
+
+signature <- data.frame(
+  gene = rownames(coef_mat)[idx],
+  coef = as.numeric(coef_mat)[idx],
+  stringsAsFactors = FALSE
+)
+
+signature <- signature[order(abs(signature$coef), decreasing = TRUE), ]
+cat("Final signature size:", nrow(signature), "\n")
+print(signature)
+
+write.csv(signature, "results/lasso_signature_lambda1se.csv", row.names = FALSE)
+```
+
+```{r}
+topN <- 300
+lasso_genes <- head(cox_res$gene, topN)
+
+cat("Genes entering LASSO:", length(lasso_genes), "\n")
+
+X_lasso <- X_all2[, lasso_genes, drop = FALSE]
+library(glmnet)
+
+y <- Surv(surv_df2$time, surv_df2$status)
+
+set.seed(1)
+cvfit <- cv.glmnet(
+  x = X_lasso,
+  y = y,
+  family = "cox",
+  alpha = 1,
+  nfolds = 10
+)
+
+plot(cvfit)
+
+coef_mat <- coef(cvfit, s = "lambda.min")
+idx <- which(as.numeric(coef_mat) != 0)
+
+signature <- data.frame(
+  gene = rownames(coef_mat)[idx],
+  coef = as.numeric(coef_mat)[idx],
+  stringsAsFactors = FALSE
+)
+
+cat("Final signature size (lambda.min):", nrow(signature), "\n")
+print(signature)
+```
+```{r}
+# Get coefficient matrix across the full lambda path
+beta <- as.matrix(coef(cvfit$glmnet.fit))   # rows = genes, cols = lambda
+
+# Count selected genes at each lambda (exclude intercept row if it exists)
+n_genes <- colSums(beta != 0)
+
+# Sanity checks
+length(n_genes)
+head(n_genes)
+range(n_genes)
+
+# Plot
+plot(
+  x = seq_along(n_genes),
+  y = n_genes,
+  type = "l",
+  xlab = "Lambda index (along path)",
+  ylab = "Number of selected genes"
+)
+```
+```{r}
+target <- 15
+idx <- which.min(abs(n_genes - target))
+
+idx
+n_genes[idx]
+lambda_custom <- cvfit$glmnet.fit$lambda[idx]
+lambda_custom
+```
+
+```{r}
+coef_custom <- coef(cvfit$glmnet.fit, s = lambda_custom)
+idx_custom <- which(as.numeric(coef_custom) != 0)
+
+signature_custom <- data.frame(
+  gene = rownames(coef_custom)[idx_custom],
+  coef = as.numeric(coef_custom)[idx_custom],
+  stringsAsFactors = FALSE
+)
+
+cat("Final signature size (custom):", nrow(signature_custom), "\n")
+print(signature_custom)
+```
+```{r}
+library(dplyr)
+library(survival)
+library(glmnet)
+
+dir.create("results", showWarnings = FALSE)
+
+# 1) Load DE table with gene symbols (created earlier)
+# If you don't have this file, tell me and I’ll point to the right one in your folder.
+de_sym <- read.csv("results/DE_with_symbols.csv", stringsAsFactors = FALSE)
+
+# 2) Recreate strict DE gene list (same thresholds you used)
+sig_strict_genes <- unique(na.omit(de_sym$symbol[de_sym$adj.P.Val < 0.01 & abs(de_sym$logFC) > 1.5]))
+cat("Strict genes (symbols):", length(sig_strict_genes), "\n")
+
+# 3) Keep strict genes present in expression matrix
+genes_for_cox <- intersect(sig_strict_genes, rownames(crc_tpm_log_gene))
+cat("Strict genes present in expr:", length(genes_for_cox), "\n")
+
+# 4) Build X matrix on surv_df2 samples (samples x genes)
+X_all2 <- t(crc_tpm_log_gene[genes_for_cox, surv_df2$sample, drop = FALSE])
+X_all2 <- as.matrix(X_all2)
+
+# Drop zero-variance genes
+sdv <- apply(X_all2, 2, sd, na.rm = TRUE)
+X_all2 <- X_all2[, sdv > 0, drop = FALSE]
+cat("Genes after zero-variance removal:", ncol(X_all2), "\n")
+
+# 5) Univariate Cox p-value ranking
+y <- Surv(surv_df2$time, surv_df2$status)
+```
+
+
+```{r}
+# List all files in results folder
+list.files("results/", full.names = TRUE)
+
+# See more details (size, modification time)
+file_info <- file.info(list.files("results/", full.names = TRUE))
+print(file_info)
+
+# Look for specific file types
+cat("\nCSV files:\n")
+print(list.files("results/", pattern = "\\.csv$"))
+
+cat("\nRDS files:\n")
+print(list.files("results/", pattern = "\\.rds$"))
+
+cat("\nRData files:\n")
+print(list.files("results/", pattern = "\\.RData$|\\.rda$"))
+```
+
+
+```{r}
+library(dplyr)
+library(survival)
+library(glmnet)
+
+dir.create("results", showWarnings = FALSE)
+
+# 1) Load DE table with gene symbols (created earlier)
+# If you don't have this file, tell me and I’ll point to the right one in your folder.
+de_sym <- read.csv("results/DE_with_symbols.csv", stringsAsFactors = FALSE)
+
+# 2) Recreate strict DE gene list (same thresholds you used)
+sig_strict_genes <- unique(na.omit(de_sym$symbol[de_sym$adj.P.Val < 0.01 & abs(de_sym$logFC) > 1.5]))
+cat("Strict genes (symbols):", length(sig_strict_genes), "\n")
+
+# 3) Keep strict genes present in expression matrix
+genes_for_cox <- intersect(sig_strict_genes, rownames(crc_tpm_log_gene))
+cat("Strict genes present in expr:", length(genes_for_cox), "\n")
+
+# 4) Build X matrix on surv_df2 samples (samples x genes)
+X_all2 <- t(crc_tpm_log_gene[genes_for_cox, surv_df2$sample, drop = FALSE])
+X_all2 <- as.matrix(X_all2)
+
+# Drop zero-variance genes
+sdv <- apply(X_all2, 2, sd, na.rm = TRUE)
+X_all2 <- X_all2[, sdv > 0, drop = FALSE]
+cat("Genes after zero-variance removal:", ncol(X_all2), "\n")
+
+# 5) Univariate Cox p-value ranking
+y <- Surv(surv_df2$time, surv_df2$status)
+```
+```{r}
+cox_p <- apply(X_all2, 2, function(x){
+  fit <- tryCatch(coxph(y ~ x), error = function(e) NULL)
+  if (is.null(fit)) return(NA_real_)
+  summary(fit)$coef[1, "Pr(>|z|)"]
+})
+
+cox_res <- data.frame(
+  gene = names(cox_p),
+  p = as.numeric(cox_p),
+  stringsAsFactors = FALSE
+) %>%
+  filter(!is.na(p)) %>%
+  arrange(p)
+
+write.csv(cox_res, "results/univariate_cox_ranked_p.csv", row.names = FALSE)
+
+# 6) Take top 300 genes for penalised Cox
+topN <- 300
+lasso_genes <- head(cox_res$gene, topN)
+X_lasso <- X_all2[, lasso_genes, drop = FALSE]
+
+cat("Genes entering LASSO:", ncol(X_lasso), "\n")
+
+# 7) Fit penalised Cox (LASSO) with CV
+set.seed(1)
+cvfit <- cv.glmnet(
+  x = X_lasso,
+  y = y,
+  family = "cox",
+  alpha = 1,
+  nfolds = 10
+)
+
+# 8) Pick lambda that gives exactly 13 genes (or closest)
+beta <- as.matrix(coef(cvfit$glmnet.fit))   # genes x lambdas
+n_genes <- colSums(beta != 0)
+
+target <- 13
+idx <- which.min(abs(n_genes - target))
+
+cat("Closest signature size to", target, "is", n_genes[idx], "genes at lambda index", idx, "\n")
+
+lambda_custom <- cvfit$glmnet.fit$lambda[idx]
+coef_custom <- coef(cvfit$glmnet.fit, s = lambda_custom)
+
+nz <- which(as.numeric(coef_custom) != 0)
+
+signature_custom <- data.frame(
+  gene = rownames(coef_custom)[nz],
+  coef = as.numeric(coef_custom)[nz],
+  stringsAsFactors = FALSE
+)
+
+cat("Final signature size (custom):", nrow(signature_custom), "\n")
+print(signature_custom)
+
+# 9) Save signature so you don't lose it again
+write.csv(signature_custom, "results/lasso_signature_lambda_custom.csv", row.names = FALSE)
+saveRDS(cvfit, "results/cvfit_custom.rds")
+```
+
+
+```{r}
+```
+```{r}
+library(survival)
+library(survminer)
+
+# Load signature (just to be safe)
+signature_custom <- read.csv("results/lasso_signature_lambda_custom.csv", stringsAsFactors = FALSE)
+
+# Build risk score using the same X_lasso matrix used for fitting
+X_sig <- X_lasso[, signature_custom$gene, drop = FALSE]
+risk_score <- as.numeric(X_sig %*% signature_custom$coef)
+
+surv_df2$risk_score <- risk_score
+cut <- median(risk_score, na.rm = TRUE)
+surv_df2$risk_group <- ifelse(risk_score >= cut, "High", "Low")
+table(surv_df2$risk_group)
+
+# KM plot
+fit_km <- survfit(Surv(time, status) ~ risk_group, data = surv_df2)
+ggsurvplot(fit_km, data = surv_df2, pval = TRUE, risk.table = TRUE, conf.int = FALSE)
+
+# Continuous Cox (main reported result)
+fit_cox <- coxph(Surv(time, status) ~ risk_score, data = surv_df2)
+summary(fit_cox)
+```
+```{r}
+library(GEOquery)
+library(Biobase)
+
+# If you saved it earlier:
+# eset <- readRDS("data/geo/GSE39582_eset.rds")
+
+# If not saved, download again:
+gse <- getGEO("GSE39582", GSEMatrix = TRUE)
+eset <- gse[[1]]
+
+# Save for safety (so you don’t lose it again)
+dir.create("data/geo", recursive = TRUE, showWarnings = FALSE)
+saveRDS(eset, "data/geo/GSE39582_eset.rds")
+
+expr <- exprs(eset)
+pheno <- pData(eset)
+
+dim(expr)
+dim(pheno)
+```
+```{r}
+colnames(pheno)
+head(pheno[, 1:20])
+```
+```{r}
+library(GEOquery)
+library(Biobase)
+library(dplyr)
+library(survival)
+library(survminer)
+
+# 1) Load expression + phenotype (you already have eset/expr/pheno in memory)
+expr <- exprs(eset)     # probes x samples
+pheno <- pData(eset)
+
+# 2) Load your final signature
+signature_custom <- read.csv("results/lasso_signature_lambda_custom.csv", stringsAsFactors = FALSE)
+
+# 3) Get platform annotation for probe -> gene symbol mapping
+gpl_id <- annotation(eset)
+gpl <- getGEO(gpl_id)
+gpl_table <- Table(gpl)
+
+# Identify symbol column (for GPL570 it's usually "Gene Symbol")
+symbol_col_candidates <- c("Gene Symbol","GENE_SYMBOL","Gene symbol","Symbol","SYMBOL")
+symbol_col <- symbol_col_candidates[symbol_col_candidates %in% colnames(gpl_table)][1]
+if (is.na(symbol_col)) stop("No gene symbol column found in GPL table.")
+
+map <- gpl_table[, c("ID", symbol_col)]
+colnames(map) <- c("probe", "symbol")
+
+# Clean symbols
+map$symbol <- gsub(" ///.*$", "", map$symbol)
+map$symbol <- trimws(map$symbol)
+
+# Keep mapped probes
+map <- map[map$probe %in% rownames(expr) & !is.na(map$symbol) & map$symbol != "", ]
+
+# Map expression probes -> symbols
+expr_mapped <- expr[map$probe, , drop = FALSE]
+rownames(expr_mapped) <- map$symbol
+
+# Collapse duplicate gene symbols by mean
+expr_gene <- rowsum(expr_mapped, group = rownames(expr_mapped))
+
+cat("GSE39582 gene-level matrix:", dim(expr_gene), "\n")
+
+# 4) Build validation survival (OS)
+# Convert months -> days (optional). You can also keep months; just be consistent.
+pheno$os_time_months <- as.numeric(pheno[["os.delay (months):ch1"]])
+pheno$os_event_raw <- pheno[["os.event:ch1"]]
+
+# Clean event to 0/1
+# Often stored like "0" / "1" or "censored" / "relapse"
+pheno$os_event <- as.numeric(as.character(pheno$os_event_raw))
+# If conversion produced NAs, handle alternative encodings:
+if (all(is.na(pheno$os_event))) {
+  pheno$os_event <- ifelse(grepl("1|death|dead|event", pheno$os_event_raw, ignore.case = TRUE), 1, 0)
+}
+
+# Keep valid samples
+val_df <- pheno %>%
+  mutate(sample = rownames(pheno)) %>%
+  filter(!is.na(os_time_months), os_time_months > 0, !is.na(os_event))
+
+cat("Validation samples with OS:", nrow(val_df), "\n")
+table(val_df$os_event)
+
+# 5) Compute risk score in validation cohort using SAME coefficients
+common <- intersect(signature_custom$gene, rownames(expr_gene))
+cat("Signature genes matched in GSE39582:", length(common), "/", nrow(signature_custom), "\n")
+print(common)
+
+sig_val <- signature_custom[signature_custom$gene %in% common, ]
+expr_val <- t(expr_gene[common, val_df$sample, drop = FALSE])  # samples x genes
+
+# Z-score per gene for cross-platform stability
+expr_val_z <- scale(expr_val)
+
+risk_val <- as.numeric(expr_val_z[, sig_val$gene, drop = FALSE] %*% sig_val$coef)
+val_df$risk_score <- risk_val
+
+# Median split (validation)
+cut <- median(val_df$risk_score, na.rm = TRUE)
+val_df$risk_group <- ifelse(val_df$risk_score >= cut, "High", "Low")
+table(val_df$risk_group)
+
+# 6) KM + Cox in validation cohort
+fit_km_val <- survfit(Surv(os_time_months, os_event) ~ risk_group, data = val_df)
+
+ggsurvplot(
+  fit_km_val,
+  data = val_df,
+  pval = TRUE,
+  risk.table = TRUE,
+  conf.int = FALSE,
+  title = "GSE39582 External Validation (OS)"
+)
+
+fit_cox_val <- coxph(Surv(os_time_months, os_event) ~ risk_score, data = val_df)
+summary(fit_cox_val)
+```
+```{r}
+val_df$stage <- pheno[val_df$sample, "tnm.stage:ch1"]
+
+fit_multi_val <- coxph(
+  Surv(os_time_months, os_event) ~ risk_score + stage,
+  data = val_df
+)
+
+summary(fit_multi_val)
+```
+```{r}
+cox_stage <- coxph(Surv(os_time_months, os_event) ~ stage, data = val_df)
+summary(cox_stage)$concordance
+
+cox_risk <- coxph(Surv(os_time_months, os_event) ~ risk_score, data = val_df)
+summary(cox_risk)$concordance
+
+cox_both <- coxph(Surv(os_time_months, os_event) ~ risk_score + stage, data = val_df)
+summary(cox_both)$concordance
+```
+```{r}
+saveRDS(signature_custom, "results/final_13_gene_signature.rds")
+write.csv(signature_custom, "results/final_13_gene_signature.csv", row.names = FALSE)
+
+saveRDS(surv_df2, "results/tcga_survival_data.rds")
+saveRDS(val_df, "results/gse39582_validation_data.rds")
+```
+
+```{r}
+# ---------------------------
+# Packages (install if needed)
+# ---------------------------
+pkgs <- c(
+  "ggplot2","dplyr","readr","stringr","ggrepel","scales",
+  "patchwork","survival","survminer"
+)
+to_install <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
+if (length(to_install) > 0) install.packages(to_install)
+
+# Workflow diagram tools (optional but recommended)
+if (!"DiagrammeR" %in% installed.packages()[, "Package"]) install.packages("DiagrammeR")
+if (!"DiagrammeRsvg" %in% installed.packages()[, "Package"]) install.packages("DiagrammeRsvg")
+if (!"rsvg" %in% installed.packages()[, "Package"]) install.packages("rsvg")
+
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(stringr)
+library(ggrepel)
+library(scales)
+library(patchwork)
+library(survival)
+library(survminer)
+
+# ---------------------------
+# Output folder
+# ---------------------------
+dir.create("figures", showWarnings = FALSE)
+
+# ---------------------------
+# Publication theme
+# ---------------------------
+theme_pub <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.title = element_text(face = "bold"),
+      legend.title = element_text(face = "bold"),
+      legend.position = "right",
+      panel.grid = element_blank()
+    )
+}
+
+ggsave_pub <- function(filename_base, plot, w = 6.5, h = 5) {
+  ggsave(file.path("figures", paste0(filename_base, ".png")),
+         plot = plot, width = w, height = h, dpi = 300, bg = "white")
+  ggsave(file.path("figures", paste0(filename_base, ".pdf")),
+         plot = plot, width = w, height = h, device = cairo_pdf, bg = "white")
+}
+```
+```{r}
+# Install if needed
+pkgs <- c("ggplot2","dplyr","readr","stringr","ggrepel",
+          "survival","survminer","patchwork","scales")
+
+to_install <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
+if (length(to_install) > 0) install.packages(to_install)
+
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(stringr)
+library(ggrepel)
+library(survival)
+library(survminer)
+library(patchwork)
+library(scales)
+
+dir.create("figures", showWarnings = FALSE)
+
+# Publication theme
+theme_pub <- function(base_size = 13) {
+  theme_classic(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.title = element_text(face = "bold"),
+      legend.title = element_text(face = "bold")
+    )
+}
+
+save_pub <- function(name, plot, w = 7, h = 6) {
+  ggsave(paste0("figures/", name, ".png"),
+         plot, width = w, height = h, dpi = 300, bg = "white")
+  ggsave(paste0("figures/", name, ".pdf"),
+         plot, width = w, height = h, device = cairo_pdf, bg = "white")
+}
+```
+
+```{r}
+immune_score  <- readRDS("data/tcga/immune_score_ssgsea.rds")
+stromal_score <- readRDS("data/tcga/stromal_score_ssgsea.rds")
+phenotype     <- readRDS("data/tcga/immune_exclusion_phenotype.rds")
+
+df_scores <- data.frame(
+  immune_score = immune_score,
+  stromal_score = stromal_score,
+  phenotype = factor(phenotype[names(immune_score)],
+                     levels = c("Immune_Inflamed","Immune_Excluded","Other"))
+)
+
+p2a <- ggplot(df_scores, aes(phenotype, immune_score)) +
+  geom_boxplot(width = 0.6) +
+  labs(title = "Immune Infiltration Score",
+       x = NULL, y = "ssGSEA Score") +
+  theme_pub()
+
+p2b <- ggplot(df_scores, aes(phenotype, stromal_score)) +
+  geom_boxplot(width = 0.6) +
+  labs(title = "Stromal / ECM Barrier Score",
+       x = NULL, y = "ssGSEA Score") +
+  theme_pub()
+
+p2 <- p2a / p2b
+save_pub("Figure2_ssGSEA_Boxplots", p2, 7, 8)
+
+```
+
+```{r}
+de_sym <- read.csv("results/DE_with_symbols.csv")
+
+vol <- de_sym %>%
+  mutate(
+    neglog10FDR = -log10(pmax(adj.P.Val, 1e-300)),
+    significant = adj.P.Val < 0.05 & abs(logFC) > 1
+  )
+
+top_genes <- vol %>%
+  filter(significant) %>%
+  arrange(adj.P.Val) %>%
+  slice(1:12)
+
+p3 <- ggplot(vol, aes(logFC, neglog10FDR)) +
+  geom_point(aes(color = significant), alpha = 0.7, size = 1.2) +
+  scale_color_manual(values = c("grey70","red")) +
+  geom_vline(xintercept = c(-1,1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_text_repel(data = top_genes,
+                  aes(label = symbol),
+                  size = 3,
+                  max.overlaps = 20) +
+  labs(title = "Volcano Plot: Immune Excluded vs Inflamed",
+       x = "log2 Fold Change",
+       y = expression(-log[10]("FDR"))) +
+  theme_pub()
+
+save_pub("Figure3_Volcano", p3)
+```
+
+```{r}
+C_stage <- 0.63394656
+C_risk <- 0.55610238
+C_combined <- 0.6619601
+
+df_c <- data.frame(
+  Model = factor(c("Stage only","Signature only","Stage + Signature"),
+                 levels = c("Stage only","Signature only","Stage + Signature")),
+  C_index = c(C_stage, C_risk, C_combined)
+)
+
+p6 <- ggplot(df_c, aes(Model, C_index)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = round(C_index,3)), vjust = -0.5) +
+  scale_y_continuous(limits = c(0,1)) +
+  labs(title = "C-index Comparison (Validation Cohort)",
+       y = "C-index", x = NULL) +
+  theme_pub()
+
+save_pub("Figure6_Cindex_Comparison", p6)
+```
+
+```{r}
+workflow_df <- data.frame(
+  step = 1:7,
+  label = c(
+    "TCGA-COAD/READ\nRNA-seq + Clinical Data",
+    "Preprocessing\nTPM + log2 + QC",
+    "ssGSEA\nImmune & Stromal Scores",
+    "Immune Phenotype Stratification",
+    "Differential Expression",
+    "Penalised Cox (LASSO)\n13-Gene Signature",
+    "External Validation\nGSE39582"
+  )
+)
+
+p1 <- ggplot(workflow_df, aes(x = step, y = 1)) +
+  geom_text(aes(label = label), size = 4) +
+  geom_segment(aes(x = step - 0.5, xend = step + 0.5, y = 1, yend = 1),
+               arrow = arrow(length = unit(0.2,"cm"))) +
+  theme_void() +
+  labs(title = "Study Workflow") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+save_pub("Figure1_Workflow", p1, 10, 3)
+```
+
+
+```{r}
+p4 <- ggsurvplot(
+  fit_tcga,
+  data = surv_df2,
+  pval = TRUE,
+  risk.table = TRUE,
+  conf.int = FALSE,
+  title = "TCGA Discovery Cohort",
+  legend.title = "Risk Group"
+)
+
+# Save main KM curve only
+ggsave("figures/Figure4_TCGA_KM.png", p4$plot, width = 7, height = 5.5, dpi = 300, bg = "white")
+ggsave("figures/Figure4_TCGA_KM.pdf", p4$plot, width = 7, height = 5.5, device = cairo_pdf, bg = "white")
+```
+
+
+```{r}
+p5 <- ggsurvplot(
+  fit_geo,
+  data = val_df,
+  pval = TRUE,
+  risk.table = TRUE,
+  conf.int = FALSE,
+  title = "GSE39582 External Validation",
+  legend.title = "Risk Group"
+)
+
+ggsave("figures/Figure5_GSE39582_KM.png", p5$plot, width = 7, height = 5.5, dpi = 300, bg = "white")
+ggsave("figures/Figure5_GSE39582_KM.pdf", p5$plot, width = 7, height = 5.5, device = cairo_pdf, bg = "white")
+```
+
+```{r}
+lp4 <- ggsurvplot(
+  fit_tcga,
+  data = surv_df2,
+  pval = TRUE,
+  risk.table = TRUE,
+  conf.int = FALSE,
+  title = "TCGA Discovery Cohort",
+  legend.title = "Risk Group"
+)
+
+ggsave("figures/Figure4_TCGA_KM.png", p4$plot, width = 7, height = 5.5, dpi = 300, bg = "white")
+ggsave("figures/Figure4_TCGA_KM.pdf", p4$plot, width = 7, height = 5.5, device = cairo_pdf, bg = "white")
+```
+
+```{r}
+library(survminer)
+
+p4 <- ggsurvplot(
+  fit_tcga,
+  data = surv_df2,
+  pval = TRUE,
+  risk.table = TRUE,
+  conf.int = FALSE,
+  title = "TCGA Discovery Cohort",
+  legend.title = "Risk Group"
+)
+
+# IMPORTANT: pass a LIST of ggsurvplot objects
+g4 <- arrange_ggsurvplots(list(p4), print = FALSE)
+
+ggsave("figures/Figure4_TCGA_KM_withTable.png", g4, width = 7, height = 7, dpi = 300, bg = "white")
+ggsave("figures/Figure4_TCGA_KM_withTable.pdf", g4, width = 7, height = 7, device = cairo_pdf, bg = "white")
+```
+```{r}
+immune_score  <- readRDS("data/tcga/immune_score_ssgsea.rds")
+stromal_score <- readRDS("data/tcga/stromal_score_ssgsea.rds")
+phenotype     <- readRDS("data/tcga/immune_exclusion_phenotype.rds")
+
+df_scores <- data.frame(
+  immune_score = immune_score,
+  stromal_score = stromal_score,
+  phenotype = factor(phenotype[names(immune_score)],
+                     levels = c("Immune_Inflamed","Immune_Excluded","Other"))
+)
+
+theme_pub <- function() {
+  theme_classic() +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.title = element_text(face = "bold")
+    )
+}
+
+p2a <- ggplot(df_scores, aes(phenotype, immune_score)) +
+  geom_boxplot() +
+  labs(title="Immune Infiltration Score", y="ssGSEA Score", x=NULL) +
+  theme_pub()
+
+p2b <- ggplot(df_scores, aes(phenotype, stromal_score)) +
+  geom_boxplot() +
+  labs(title="Stromal / ECM Score", y="ssGSEA Score", x=NULL) +
+  theme_pub()
+
+p2a / p2b
+```
+```{r}
+de_sym <- read.csv("results/DE_with_symbols.csv")
+
+vol <- de_sym %>%
+  mutate(
+    neglog10FDR = -log10(pmax(adj.P.Val, 1e-300)),
+    significant = adj.P.Val < 0.05 & abs(logFC) > 1
+  )
+
+top_genes <- vol %>%
+  filter(significant) %>%
+  arrange(adj.P.Val) %>%
+  slice(1:12)
+
+ggplot(vol, aes(logFC, neglog10FDR)) +
+  geom_point(aes(color=significant), alpha=0.7) +
+  scale_color_manual(values=c("grey70","red")) +
+  geom_vline(xintercept=c(-1,1), linetype="dashed") +
+  geom_hline(yintercept=-log10(0.05), linetype="dashed") +
+  geom_text_repel(data=top_genes, aes(label=symbol), size=3) +
+  labs(title="Volcano: Immune Excluded vs Inflamed",
+       x="log2 Fold Change",
+       y=expression(-log[10]("FDR"))) +
+  theme_pub()
+```
+```{r}
+surv_df2 <- readRDS("results/tcga_survival_data.rds")
+
+cut <- median(surv_df2$risk_score, na.rm=TRUE)
+surv_df2$risk_group <- ifelse(surv_df2$risk_score >= cut,"High","Low")
+
+fit_tcga <- survfit(Surv(time, status) ~ risk_group, data=surv_df2)
+
+p4 <- ggsurvplot(
+  fit_tcga,
+  data=surv_df2,
+  pval=TRUE,
+  risk.table=TRUE,
+  conf.int=FALSE,
+  legend.title="Risk Group",
+  title="TCGA Discovery Cohort"
+)
+
+print(p4)
+```
+```{r}
+val_df <- readRDS("results/gse39582_validation_data.rds")
+
+fit_geo <- survfit(Surv(os_time_months, os_event) ~ risk_group, data=val_df)
+
+p5 <- ggsurvplot(
+  fit_geo,
+  data=val_df,
+  pval=TRUE,
+  risk.table=TRUE,
+  conf.int=FALSE,
+  legend.title="Risk Group",
+  title="GSE39582 External Validation"
+)
+
+print(p5)
+```
+```{r}
+C_stage <- 0.63394656
+C_risk <- 0.55610238
+C_combined <- 0.6619601
+
+df_c <- data.frame(
+  Model=c("Stage only","Signature only","Stage + Signature"),
+  C_index=c(C_stage,C_risk,C_combined)
+)
+
+ggplot(df_c, aes(Model,C_index)) +
+  geom_col(width=0.7) +
+  geom_text(aes(label=round(C_index,3)), vjust=-0.5) +
+  scale_y_continuous(limits=c(0,1)) +
+  labs(title="C-index Comparison",
+       y="C-index", x=NULL) +
+  theme_pub()
+```
+```{r}
+library(knitr)
+
+workflow_table <- data.frame(
+  Step = 1:7,
+  Stage = c(
+    "TCGA-COAD/READ RNA-seq + Clinical Data",
+    "Data Preprocessing (TPM, log2 transformation, QC)",
+    "ssGSEA Immune and Stromal Scoring",
+    "Immune Phenotype Stratification (Excluded vs Inflamed)",
+    "Differential Expression Analysis (limma)",
+    "Penalised Cox Regression (LASSO) – 13-Gene Signature",
+    "External Validation in GSE39582 (Multivariate Cox)"
+  )
+)
+
+kable(workflow_table,
+      caption = "Table 1. Overview of the study workflow.",
+      align = c("c","l"))
+```
+
+

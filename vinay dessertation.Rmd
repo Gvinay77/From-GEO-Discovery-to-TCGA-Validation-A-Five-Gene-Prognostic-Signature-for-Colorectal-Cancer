@@ -1,0 +1,2350 @@
+```{r}
+# Clean session
+rm(list = ls())
+gc()
+
+options(stringsAsFactors = FALSE)
+set.seed(1)
+
+# Set your main working directory
+root_dir <- "C:/Users/Public/vinay"
+setwd(root_dir)
+
+# Create folder structure
+dir.create("data", showWarnings = FALSE)
+dir.create("data/geo", showWarnings = FALSE)
+dir.create("data/tcga", showWarnings = FALSE)
+dir.create("results", showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+dir.create("scripts", showWarnings = FALSE)
+
+cat("Environment setup complete\n")
+```
+```{r}
+# Install BiocManager if missing
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+# CRAN packages
+cran_pkgs <- c(
+  "dplyr",
+  "ggplot2",
+  "tibble",
+  "stringr",
+  "pheatmap",
+  "reshape2",
+  "data.table",
+  "survival",
+  "survminer",
+  "glmnet",
+  "readr"
+)
+
+# Bioconductor packages
+bioc_pkgs <- c(
+  "Biobase",
+  "GEOquery",
+  "limma"
+)
+
+# Install missing CRAN packages only
+for (pkg in cran_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+# Install missing Bioconductor packages only
+for (pkg in bioc_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, ask = FALSE, update = FALSE)
+  }
+}
+
+# Load packages
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(stringr)
+library(pheatmap)
+library(reshape2)
+library(data.table)
+library(survival)
+library(survminer)
+library(glmnet)
+library(readr)
+
+library(Biobase)
+library(GEOquery)
+library(limma)
+
+cat("packages loaded successfully\n")
+```
+```{r}
+# Define root again (safety)
+root_dir <- "C:/Users/Public/vinay"
+
+# GEO file
+geo_eset_file <- file.path(root_dir, "data/geo/GSE39582_eset.rds")
+
+# TCGA raw expression folder
+tcga_expr_root <- file.path(
+  root_dir,
+  "data/tcga/TCGA-COAD/Transcriptome_Profiling/Gene_Expression_Quantification"
+)
+
+# Results files
+de_symbols_file         <- file.path(root_dir, "results/DE_with_symbols.csv")
+tcga_survival_rds_file  <- file.path(root_dir, "results/tcga_survival_data.rds")
+gse_validation_rds_file <- file.path(root_dir, "results/gse39582_validation_data.rds")
+
+# Signature files
+sig_final_csv_file   <- file.path(root_dir, "results/final_13_gene_signature.csv")
+sig_custom_csv_file  <- file.path(root_dir, "results/lasso_signature_lambda_custom.csv")
+
+# Check all paths
+path_check <- data.frame(
+  file = c(
+    geo_eset_file,
+    tcga_expr_root,
+    de_symbols_file,
+    tcga_survival_rds_file,
+    gse_validation_rds_file,
+    sig_final_csv_file,
+    sig_custom_csv_file
+  ),
+  exists = file.exists(c(
+    geo_eset_file,
+    tcga_expr_root,
+    de_symbols_file,
+    tcga_survival_rds_file,
+    gse_validation_rds_file,
+    sig_final_csv_file,
+    sig_custom_csv_file
+  ))
+)
+
+print(path_check)
+print(path_check, row.names = FALSE)
+as.data.frame(path_check)
+path_check$exists
+cbind(path_check$file, path_check$exists)
+```
+
+```{r}
+# Load DE table
+de_sym <- read.csv(de_symbols_file, stringsAsFactors = FALSE)
+
+cat("DE table dimensions:", dim(de_sym), "\n")
+print(colnames(de_sym))
+
+# Load signature
+if (file.exists(sig_final_csv_file)) {
+  signature_custom <- read.csv(sig_final_csv_file, stringsAsFactors = FALSE)
+} else {
+  signature_custom <- read.csv(sig_custom_csv_file, stringsAsFactors = FALSE)
+}
+
+cat("Loaded signature size:", nrow(signature_custom), "\n")
+print(signature_custom)
+
+# Load saved TCGA survival object
+tcga_data <- readRDS(tcga_survival_rds_file)
+cat("TCGA RDS class:\n")
+print(class(tcga_data))
+if (is.list(tcga_data) || is.data.frame(tcga_data)) {
+  cat("TCGA RDS names:\n")
+  print(names(tcga_data))
+}
+
+# Load saved GSE validation object
+gse_data <- readRDS(gse_validation_rds_file)
+cat("GSE validation RDS class:\n")
+print(class(gse_data))
+if (is.list(gse_data) || is.data.frame(gse_data)) {
+  cat("GSE validation RDS names:\n")
+  print(names(gse_data))
+}
+
+# Load GEO ExpressionSet too, just to inspect it
+geo_eset <- readRDS(geo_eset_file)
+cat("GEO eset class:\n")
+print(class(geo_eset))
+
+if (inherits(geo_eset, "ExpressionSet")) {
+  cat("GEO expression matrix dim:", dim(exprs(geo_eset)), "\n")
+  cat("GEO pheno data dim:", dim(pData(geo_eset)), "\n")
+}
+```
+```{r}
+# Find all files inside the TCGA quantification folders
+all_tcga_files <- list.files(
+  tcga_expr_root,
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+cat("Total files found:", length(all_tcga_files), "\n")
+
+# Keep likely gene quantification text files
+tcga_quant_files <- all_tcga_files[
+  grepl("\\.(txt|tsv|csv|gz)$", all_tcga_files, ignore.case = TRUE)
+]
+
+cat("Candidate quantification files:", length(tcga_quant_files), "\n")
+
+# Show first few so we can inspect naming
+print(head(tcga_quant_files, 10))
+
+# Read one example file to inspect structure
+test_file <- tcga_quant_files[1]
+cat("Testing file:\n", test_file, "\n\n")
+
+test_dat <- tryCatch(
+  fread(test_file, data.table = FALSE),
+  error = function(e) NULL
+)
+
+if (is.null(test_dat)) {
+  stop("Could not read the first TCGA quantification file.")
+}
+
+cat("Dimensions of first file:", dim(test_dat), "\n")
+print(colnames(test_dat))
+print(head(test_dat))
+```
+
+```{r}
+# Keep only STAR gene count TSV files
+tcga_quant_files <- all_tcga_files[
+  grepl("rna_seq\\.augmented_star_gene_counts\\.tsv$", all_tcga_files, ignore.case = TRUE)
+]
+
+cat("STAR quantification files:", length(tcga_quant_files), "\n")
+
+if (length(tcga_quant_files) == 0) {
+  stop("No STAR gene count TSV files found.")
+}
+
+# Helper: extract sample barcode from filename/folder later if present in metadata
+# For now we use folder order and recover from tcga survival later by overlap if needed.
+# Build expression matrix from TPM column.
+
+read_one_tcga_tpm <- function(f) {
+  dat <- fread(f, data.table = FALSE)
+  
+  # remove technical summary rows
+  dat <- dat[grepl("^ENSG", dat$gene_id), ]
+  
+  # keep the 3 columns we need
+  dat <- dat[, c("gene_id", "gene_name", "tpm_unstranded")]
+  colnames(dat) <- c("gene_id", "gene_name", "tpm")
+  
+  dat
+}
+
+# Read first file to initialize
+first_dat <- read_one_tcga_tpm(tcga_quant_files[1])
+
+cat("First filtered file dim:", dim(first_dat), "\n")
+print(head(first_dat))
+
+gene_annot <- first_dat[, c("gene_id", "gene_name")]
+
+# Build matrix
+expr_list <- lapply(tcga_quant_files, function(f) {
+  dat <- read_one_tcga_tpm(f)
+  dat$tpm
+})
+
+expr_mat <- do.call(cbind, expr_list)
+
+# Use file basenames temporarily as sample names
+colnames(expr_mat) <- basename(dirname(tcga_quant_files))
+rownames(expr_mat) <- first_dat$gene_id
+
+cat("Raw TCGA TPM matrix dim:", dim(expr_mat), "\n")
+
+# Save raw Ensembl-level matrix
+saveRDS(expr_mat, file.path(root_dir, "results", "tcga_tpm_ensembl_raw.rds"))
+write.csv(gene_annot, file.path(root_dir, "results", "tcga_gene_annotation.csv"), row.names = FALSE)
+
+cat("Raw TCGA TPM matrix saved\n")
+```
+```{r}
+# Load the matrix we just saved
+expr_mat <- readRDS(file.path(root_dir, "results", "tcga_tpm_ensembl_raw.rds"))
+
+cat("Matrix dim:", dim(expr_mat), "\n")
+
+############################
+# 1. Check duplicates (Ensembl IDs with versions)
+############################
+
+gene_ids <- rownames(expr_mat)
+
+# Remove version numbers
+gene_ids_clean <- sub("\\..*$", "", gene_ids)
+
+dup_count <- sum(duplicated(gene_ids_clean))
+cat("Duplicate genes after removing version:", dup_count, "\n")
+
+############################
+# 2. Check zero variance genes
+############################
+
+sd_vals <- apply(expr_mat, 1, sd)
+zero_var <- sum(sd_vals == 0)
+
+cat("Zero-variance genes:", zero_var, "\n")
+
+############################
+# 3. Check missing values
+############################
+
+na_count <- sum(is.na(expr_mat))
+cat("Total NA values:", na_count, "\n")
+
+############################
+# 4. Check non-finite values
+############################
+
+inf_count <- sum(!is.finite(expr_mat))
+cat("Non-finite values (Inf/-Inf/NA):", inf_count, "\n")
+
+############################
+# 5. Quick summary of TPM
+############################
+
+summary(as.vector(expr_mat))
+```
+```{r}
+library(dplyr)
+
+# Load raw matrix + annotation
+expr_mat <- readRDS(file.path(root_dir, "results", "tcga_tpm_ensembl_raw.rds"))
+gene_annot <- read.csv(file.path(root_dir, "results", "tcga_gene_annotation.csv"))
+
+############################
+# FAST: Clean Ensembl IDs once
+############################
+
+rownames_clean <- sub("\\..*$", "", rownames(expr_mat))
+
+############################
+# FAST: Prepare annotation lookup
+############################
+
+gene_annot$gene_id_clean <- sub("\\..*$", "", gene_annot$gene_id)
+# Create named vector for faster lookup
+symbol_lookup <- setNames(gene_annot$gene_name, gene_annot$gene_id_clean)
+# Keep only unique, non-empty symbols
+symbol_lookup <- symbol_lookup[!is.na(symbol_lookup) & symbol_lookup != ""]
+
+############################
+# FAST: Match and filter in one step
+############################
+
+# Find which rows have valid symbols
+valid_idx <- which(rownames_clean %in% names(symbol_lookup))
+expr_mat_filtered <- expr_mat[valid_idx, ]
+matched_symbols <- symbol_lookup[rownames_clean[valid_idx]]
+
+cat("After matching symbols:", nrow(expr_mat_filtered), "genes\n")
+
+############################
+# FAST: Collapse duplicates using rowsum (much faster than group_by)
+############################
+
+# Create matrix with symbols as row names
+rownames(expr_mat_filtered) <- matched_symbols
+
+# Use rowsum for fast aggregation
+expr_collapsed <- rowsum(expr_mat_filtered, group = matched_symbols, reorder = TRUE)
+
+cat("After collapsing duplicates:", nrow(expr_collapsed), "genes\n")
+
+############################
+# FAST: Remove zero variance (vectorized)
+############################
+
+# Calculate variance efficiently
+vars <- apply(expr_collapsed, 1, var)
+expr_collapsed <- expr_collapsed[vars > 0, ]
+
+cat("After removing zero variance:", nrow(expr_collapsed), "genes\n")
+
+############################
+# FAST: Log2 transform
+############################
+
+crc_tpm_log_gene <- log2(expr_collapsed + 1)
+
+############################
+# Save
+############################
+
+saveRDS(crc_tpm_log_gene, file.path(root_dir, "results", "crc_tpm_log_gene.rds"))
+
+cat("FINAL MATRIX READY:", dim(crc_tpm_log_gene), "\n")
+```
+```{r}
+# Load survival table
+surv_df2 <- readRDS(tcga_survival_rds_file)
+
+cat("Survival object class:", class(surv_df2), "\n")
+cat("Survival table dim:", dim(surv_df2), "\n")
+print(colnames(surv_df2))
+
+# Keep only needed columns
+surv_df2 <- as.data.frame(surv_df2)
+
+req_cols <- c("sample", "time", "status")
+missing_cols <- setdiff(req_cols, colnames(surv_df2))
+
+if (length(missing_cols) > 0) {
+  stop("Missing required survival columns: ", paste(missing_cols, collapse = ", "))
+}
+
+surv_df2 <- surv_df2[, intersect(colnames(surv_df2), c("sample", "patient", "vital_status", "days_to_death", "days_to_last_follow_up", "time", "status", "risk_score", "risk_group"))]
+
+# Clean survival columns
+surv_df2$sample <- as.character(surv_df2$sample)
+surv_df2$time <- as.numeric(surv_df2$time)
+surv_df2$status <- as.numeric(surv_df2$status)
+
+cat("Samples before filtering:", nrow(surv_df2), "\n")
+
+surv_df2 <- surv_df2[!is.na(surv_df2$sample) & !is.na(surv_df2$time) & !is.na(surv_df2$status), ]
+surv_df2 <- surv_df2[surv_df2$time > 0, ]
+surv_df2 <- surv_df2[!duplicated(surv_df2$sample), ]
+
+cat("Samples after filtering:", nrow(surv_df2), "\n")
+print(table(surv_df2$status))
+print(summary(surv_df2$time))
+
+# Load expression matrix
+crc_tpm_log_gene <- readRDS(file.path(root_dir, "results", "crc_tpm_log_gene.rds"))
+
+cat("Expression matrix dim:", dim(crc_tpm_log_gene), "\n")
+
+# Check direct overlap
+common_samples <- intersect(surv_df2$sample, colnames(crc_tpm_log_gene))
+cat("Direct sample overlap:", length(common_samples), "\n")
+
+# Show a few survival sample names
+cat("First survival samples:\n")
+print(head(surv_df2$sample, 10))
+
+# Show a few expression column names
+cat("First expression sample names:\n")
+print(head(colnames(crc_tpm_log_gene), 10))
+```
+
+```{r}
+# Re-list all STAR files
+tcga_quant_files <- list.files(
+  tcga_expr_root,
+  recursive = TRUE,
+  full.names = TRUE,
+  pattern = "rna_seq\\.augmented_star_gene_counts\\.tsv$"
+)
+
+cat("STAR files found:", length(tcga_quant_files), "\n")
+
+# Read 1 file first to find the sample barcode column
+test_file <- tcga_quant_files[1]
+test_dat <- data.table::fread(test_file, data.table = FALSE)
+
+cat("Columns in test file:\n")
+print(colnames(test_dat))
+
+# Show the first 10 rows for likely barcode fields
+print(head(test_dat, 10))
+```
+```{r}
+# Look for likely metadata files under the TCGA-COAD folder
+tcga_root <- file.path(root_dir, "data/tcga/TCGA-COAD")
+
+meta_files <- list.files(
+  tcga_root,
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+# Show likely metadata candidates
+meta_candidates <- meta_files[
+  grepl("metadata|manifest|cart|sample_sheet|aliquot|json", meta_files, ignore.case = TRUE)
+]
+
+cat("Metadata candidate files found:", length(meta_candidates), "\n")
+print(meta_candidates)
+```
+```{r}
+# 1) Check objects already in memory
+cat("Objects in memory related to mapping:\n")
+print(ls()[grepl("sample|barcode|map|patient", ls(), ignore.case = TRUE)])
+
+# 2) Check result/data files that may contain mapping
+all_files_root <- list.files(root_dir, recursive = TRUE, full.names = TRUE)
+
+mapping_candidates <- all_files_root[
+  grepl("sample|barcode|mapping|patient|uuid|manifest|sheet", basename(all_files_root), ignore.case = TRUE)
+]
+
+cat("Possible mapping files found:", length(mapping_candidates), "\n")
+print(mapping_candidates)
+```
+```{r}
+# Load saved TCGA sample mapping
+sample_map <- readRDS("C:/Users/Public/vinay/data/tcga/TCGA_CRC_sample_patient_map.rds")
+
+cat("sample_map class:\n")
+print(class(sample_map))
+
+cat("sample_map dim:\n")
+print(dim(sample_map))
+
+cat("sample_map column names:\n")
+print(colnames(sample_map))
+
+cat("First rows of sample_map:\n")
+print(head(sample_map, 10))
+```
+```{r}
+manifest_file <- "C:/Users/Public/vinay/MANIFEST.txt"
+
+manifest <- tryCatch(
+  read.delim(manifest_file, stringsAsFactors = FALSE),
+  error = function(e) NULL
+)
+
+if (is.null(manifest)) {
+  manifest <- tryCatch(
+    data.table::fread(manifest_file, data.table = FALSE),
+    error = function(e) NULL
+  )
+}
+
+if (is.null(manifest)) {
+  stop("Could not read MANIFEST.txt")
+}
+
+cat("manifest class:\n")
+print(class(manifest))
+
+cat("manifest dim:\n")
+print(dim(manifest))
+
+cat("manifest column names:\n")
+print(colnames(manifest))
+
+cat("First rows of manifest:\n")
+print(head(manifest, 10))
+```
+```{r}
+# UUIDs currently used as expression column names
+expr_uuid <- colnames(crc_tpm_log_gene)
+
+uuid_df <- data.frame(
+  uuid = expr_uuid,
+  stringsAsFactors = FALSE
+)
+
+cat("Expression UUID count:", nrow(uuid_df), "\n")
+print(head(uuid_df, 10))
+
+# Compare with manifest IDs
+manifest$id <- as.character(manifest$id)
+
+cat("Manifest ID count:", nrow(manifest), "\n")
+cat("UUID overlap with manifest:", sum(uuid_df$uuid %in% manifest$id), "\n")
+
+# Show non-overlap if any
+not_in_manifest <- uuid_df$uuid[!uuid_df$uuid %in% manifest$id]
+cat("UUIDs not found in manifest:", length(not_in_manifest), "\n")
+print(head(not_in_manifest, 20))
+```
+```{r}
+# Pick one UUID folder from the expression matrix
+one_uuid <- colnames(crc_tpm_log_gene)[1]
+one_dir <- file.path(tcga_expr_root, one_uuid)
+
+cat("Inspecting folder:\n", one_dir, "\n\n")
+
+folder_files <- list.files(one_dir, full.names = TRUE)
+print(folder_files)
+
+# If there are any json/txt/xml files, show them separately
+sidecar_files <- folder_files[
+  grepl("\\.(json|txt|xml|csv|tsv)$", folder_files, ignore.case = TRUE)
+]
+
+cat("\nPossible sidecar files:\n")
+print(sidecar_files)
+```
+```{r}
+tcga_all_files <- list.files(
+  file.path(root_dir, "data/tcga"),
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+cat("Total files under data/tcga:", length(tcga_all_files), "\n")
+
+map_candidates <- tcga_all_files[
+  grepl("json|metadata|manifest|sheet|sample|barcode|uuid|cart", tcga_all_files, ignore.case = TRUE)
+]
+
+cat("Possible TCGA mapping files found:", length(map_candidates), "\n")
+print(map_candidates)
+```
+```{r}
+library(TCGAbiolinks)
+
+# UUIDs currently used as expression column names
+expr_uuid <- colnames(crc_tpm_log_gene)
+
+cat("Expression UUID count:", length(expr_uuid), "\n")
+
+# Query GDC metadata for the same TCGA-COAD RNA-seq files
+query_map <- GDCquery(
+  project = "TCGA-COAD",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+
+meta_map <- getResults(query_map)
+
+cat("GDC metadata dim:", dim(meta_map), "\n")
+print(colnames(meta_map))
+
+# Keep only columns useful for mapping
+map_cols <- intersect(
+  c("file_id", "file_name", "cases", "sample.submitter_id", "cases.submitter_id"),
+  colnames(meta_map)
+)
+
+uuid_map <- meta_map[, map_cols, drop = FALSE]
+
+cat("Mapping table dim:", dim(uuid_map), "\n")
+print(head(uuid_map, 10))
+
+# Match file UUIDs to your expression UUIDs
+m <- match(expr_uuid, uuid_map$file_id)
+
+matched_sample_barcodes <- if ("sample.submitter_id" %in% colnames(uuid_map)) {
+  uuid_map$sample.submitter_id[m]
+} else {
+  rep(NA_character_, length(expr_uuid))
+}
+
+cat("Matched sample barcodes:", sum(!is.na(matched_sample_barcodes)), "\n")
+print(head(matched_sample_barcodes, 20))
+
+# Rename expression columns where mapping exists
+colnames(crc_tpm_log_gene) <- matched_sample_barcodes
+
+# Keep only mapped columns
+keep_cols <- !is.na(colnames(crc_tpm_log_gene)) & colnames(crc_tpm_log_gene) != ""
+crc_tpm_log_gene <- crc_tpm_log_gene[, keep_cols, drop = FALSE]
+
+cat("Expression matrix after barcode mapping:", dim(crc_tpm_log_gene), "\n")
+print(head(colnames(crc_tpm_log_gene), 20))
+
+# Save mapped matrix
+saveRDS(crc_tpm_log_gene, file.path(root_dir, "results", "crc_tpm_log_gene_mapped.rds"))
+```
+```{r}
+# Load mapped expression
+crc_tpm_log_gene <- readRDS(file.path(root_dir, "results", "crc_tpm_log_gene_mapped.rds"))
+
+# Load survival
+surv_df2 <- readRDS(tcga_survival_rds_file)
+surv_df2 <- as.data.frame(surv_df2)
+
+# Clean survival fields
+surv_df2$sample <- as.character(surv_df2$sample)
+surv_df2$time <- as.numeric(surv_df2$time)
+surv_df2$status <- as.numeric(surv_df2$status)
+
+surv_df2 <- surv_df2[!is.na(surv_df2$sample) & !is.na(surv_df2$time) & !is.na(surv_df2$status), ]
+surv_df2 <- surv_df2[surv_df2$time > 0, ]
+surv_df2 <- surv_df2[!duplicated(surv_df2$sample), ]
+
+# Create 15-character sample IDs for matching
+surv_df2$sample15 <- substr(surv_df2$sample, 1, 15)
+expr_sample15 <- substr(colnames(crc_tpm_log_gene), 1, 15)
+
+cat("Survival samples:", nrow(surv_df2), "\n")
+cat("Expression samples:", ncol(crc_tpm_log_gene), "\n")
+
+common15 <- intersect(surv_df2$sample15, expr_sample15)
+cat("Matched 15-char sample IDs:", length(common15), "\n")
+
+# Keep matched survival rows
+surv_df2_match <- surv_df2[surv_df2$sample15 %in% common15, ]
+
+# If duplicates at 15-char level exist in survival, keep first
+surv_df2_match <- surv_df2_match[!duplicated(surv_df2_match$sample15), ]
+
+# Keep matched expression columns
+expr_keep <- expr_sample15 %in% surv_df2_match$sample15
+expr_matched <- crc_tpm_log_gene[, expr_keep, drop = FALSE]
+expr_sample15_matched <- substr(colnames(expr_matched), 1, 15)
+
+# Reorder expression columns to survival order
+ord <- match(surv_df2_match$sample15, expr_sample15_matched)
+expr_matched <- expr_matched[, ord, drop = FALSE]
+
+# Final check
+cat("Final matched survival rows:", nrow(surv_df2_match), "\n")
+cat("Final matched expression columns:", ncol(expr_matched), "\n")
+
+cat("Do names match now? ", all(surv_df2_match$sample15 == substr(colnames(expr_matched), 1, 15)), "\n")
+
+# Save aligned objects
+saveRDS(surv_df2_match, file.path(root_dir, "results", "surv_df2_matched.rds"))
+saveRDS(expr_matched, file.path(root_dir, "results", "crc_tpm_log_gene_matched.rds"))
+```
+```{r}
+# Load aligned objects
+surv_df2_match <- readRDS(file.path(root_dir, "results", "surv_df2_matched.rds"))
+expr_matched <- readRDS(file.path(root_dir, "results", "crc_tpm_log_gene_matched.rds"))
+
+# Load DE table
+de_sym <- read.csv(de_symbols_file, stringsAsFactors = FALSE)
+
+# Strict DE genes
+sig_strict_genes <- unique(
+  na.omit(de_sym$symbol[de_sym$adj.P.Val < 0.01 & abs(de_sym$logFC) > 1.5])
+)
+
+cat("Strict genes (symbols):", length(sig_strict_genes), "\n")
+
+# Keep genes present in matched expression matrix
+genes_for_cox <- intersect(sig_strict_genes, rownames(expr_matched))
+cat("Strict genes present in matched expression:", length(genes_for_cox), "\n")
+
+# Build Cox matrix: samples x genes
+X_all2 <- t(expr_matched[genes_for_cox, , drop = FALSE])
+X_all2 <- as.matrix(X_all2)
+
+cat("Initial Cox matrix dim:", dim(X_all2), "\n")
+
+# Remove zero-variance genes again just in case
+sdv <- apply(X_all2, 2, sd, na.rm = TRUE)
+X_all2 <- X_all2[, sdv > 0, drop = FALSE]
+
+cat("Cox matrix after zero-variance removal:", dim(X_all2), "\n")
+
+# Build survival object
+y <- Surv(surv_df2_match$time, surv_df2_match$status)
+
+# Save
+saveRDS(X_all2, file.path(root_dir, "results", "X_all2_matched.rds"))
+saveRDS(y, file.path(root_dir, "results", "Surv_y_matched.rds"))
+
+cat("Cox input ready\n")
+```
+
+```{r}
+# Load data
+X_all2 <- readRDS(file.path(root_dir, "results", "X_all2_matched.rds"))
+y <- readRDS(file.path(root_dir, "results", "Surv_y_matched.rds"))
+
+cat("Running univariate Cox on", ncol(X_all2), "genes...\n")
+
+# Run Cox for each gene
+cox_p <- apply(X_all2, 2, function(x) {
+  fit <- tryCatch(coxph(y ~ x), error = function(e) NULL)
+  if (is.null(fit)) return(NA_real_)
+  summary(fit)$coef[1, "Pr(>|z|)"]
+})
+
+# Create result table
+cox_res <- data.frame(
+  gene = names(cox_p),
+  p = as.numeric(cox_p),
+  stringsAsFactors = FALSE
+)
+
+cox_res <- cox_res[!is.na(cox_res$p), ]
+cox_res <- cox_res[order(cox_res$p), ]
+
+# Save results
+write.csv(cox_res, file.path(root_dir, "results", "univariate_cox_ranked_p.csv"), row.names = FALSE)
+saveRDS(cox_res, file.path(root_dir, "results", "cox_res.rds"))
+
+cat("Top 10 genes by p-value:\n")
+print(head(cox_res, 10))
+
+cat("✅ Univariate Cox complete\n")
+```
+```{r}
+# Load inputs
+X_all2 <- readRDS(file.path(root_dir, "results", "X_all2_matched.rds"))
+y <- readRDS(file.path(root_dir, "results", "Surv_y_matched.rds"))
+cox_res <- readRDS(file.path(root_dir, "results", "cox_res.rds"))
+
+############################
+# 1. Select top genes
+############################
+
+topN <- min(300, nrow(cox_res))
+lasso_genes <- head(cox_res$gene, topN)
+
+X_lasso <- X_all2[, lasso_genes, drop = FALSE]
+
+cat("Genes entering LASSO:", ncol(X_lasso), "\n")
+
+############################
+# 2. Fit LASSO Cox
+############################
+
+set.seed(1)
+
+cvfit <- cv.glmnet(
+  x = X_lasso,
+  y = y,
+  family = "cox",
+  alpha = 1,
+  nfolds = 10
+)
+
+# Save model
+saveRDS(cvfit, file.path(root_dir, "results", "cvfit_final.rds"))
+
+############################
+# 3. Check number of genes per lambda
+############################
+
+beta <- as.matrix(coef(cvfit$glmnet.fit))
+n_genes <- colSums(beta != 0)
+
+cat("Gene counts across lambdas:\n")
+print(table(n_genes))
+
+############################
+# 4. Select ~13-gene signature
+############################
+
+target <- 13
+idx <- which.min(abs(n_genes - target))
+
+cat("Closest to", target, "genes:", n_genes[idx], "\n")
+
+lambda_custom <- cvfit$glmnet.fit$lambda[idx]
+
+coef_custom <- coef(cvfit$glmnet.fit, s = lambda_custom)
+
+nz <- which(as.numeric(coef_custom) != 0)
+
+signature_custom <- data.frame(
+  gene = rownames(coef_custom)[nz],
+  coef = as.numeric(coef_custom)[nz],
+  stringsAsFactors = FALSE
+)
+
+signature_custom <- signature_custom[order(-abs(signature_custom$coef)), ]
+
+############################
+# 5. Save signature
+############################
+
+write.csv(signature_custom,
+          file.path(root_dir, "results", "final_13_gene_signature.csv"),
+          row.names = FALSE)
+
+saveRDS(signature_custom,
+        file.path(root_dir, "results", "signature_final.rds"))
+
+cat("Final signature size:", nrow(signature_custom), "\n")
+print(signature_custom)
+
+cat("✅ LASSO complete\n")
+```
+
+```{r}
+# Load objects
+signature_custom <- readRDS(file.path(root_dir, "results", "signature_final.rds"))
+expr_matched <- readRDS(file.path(root_dir, "results", "crc_tpm_log_gene_matched.rds"))
+surv_df2_match <- readRDS(file.path(root_dir, "results", "surv_df2_matched.rds"))
+
+############################
+# 1. Extract signature genes
+############################
+
+sig_genes <- intersect(signature_custom$gene, rownames(expr_matched))
+
+cat("Signature genes found in expression:", length(sig_genes), "\n")
+
+# Build expression matrix for signature
+X_sig <- t(expr_matched[sig_genes, , drop = FALSE])
+X_sig <- as.matrix(X_sig)
+
+############################
+# 2. Align coefficients
+############################
+
+coef_df <- signature_custom[match(colnames(X_sig), signature_custom$gene), ]
+beta_sig <- coef_df$coef
+
+############################
+# 3. Compute risk score
+############################
+
+risk_score <- as.numeric(X_sig %*% beta_sig)
+
+############################
+# 4. Add to survival data
+############################
+
+surv_sig <- surv_df2_match
+surv_sig$risk_score <- risk_score
+
+# Split into high/low groups
+median_cut <- median(surv_sig$risk_score, na.rm = TRUE)
+
+surv_sig$risk_group <- ifelse(
+  surv_sig$risk_score >= median_cut,
+  "High", "Low"
+)
+
+cat("Risk group distribution:\n")
+print(table(surv_sig$risk_group))
+
+############################
+# 5. Kaplan-Meier plot
+############################
+
+fit_km <- survfit(Surv(time, status) ~ risk_group, data = surv_sig)
+
+library(survminer)
+
+p <- ggsurvplot(
+  fit_km,
+  data = surv_sig,
+  pval = TRUE,
+  risk.table = TRUE,
+  conf.int = FALSE,
+  title = "TCGA CRC Survival by Risk Group",
+  palette = c("#E74C3C", "#2ECC71")
+)
+
+print(p)
+
+############################
+# 6. Save results
+############################
+
+write.csv(surv_sig,
+          file.path(root_dir, "results", "tcga_risk_scores_final.csv"),
+          row.names = FALSE)
+
+saveRDS(surv_sig,
+        file.path(root_dir, "results", "tcga_survival_with_risk.rds"))
+
+cat("Risk model complete\n")
+```
+```{r}
+# Load objects
+signature_custom <- readRDS(file.path(root_dir, "results", "signature_final.rds"))
+geo_eset <- readRDS(geo_eset_file)
+gse_data <- readRDS(gse_validation_rds_file)
+
+############################
+# 1. Extract expression matrix
+############################
+
+expr_geo <- exprs(geo_eset)
+cat("GSE expression dim:", dim(expr_geo), "\n")
+
+############################
+# 2. Check gene symbols
+############################
+
+# Try to get gene symbols from feature data
+fdata <- fData(geo_eset)
+
+cat("Feature data columns:\n")
+print(colnames(fdata))
+
+# Common columns: "Gene Symbol", "GENE_SYMBOL", "Symbol"
+symbol_col <- colnames(fdata)[grepl("symbol", colnames(fdata), ignore.case = TRUE)][1]
+
+if (is.na(symbol_col)) {
+  stop("No gene symbol column found in GEO data.")
+}
+
+cat("Using symbol column:", symbol_col, "\n")
+
+gene_symbols <- fdata[[symbol_col]]
+
+############################
+# 3. Map expression to symbols
+############################
+
+expr_geo_df <- as.data.frame(expr_geo)
+expr_geo_df$symbol <- gene_symbols
+
+# Remove missing symbols
+expr_geo_df <- expr_geo_df[!is.na(expr_geo_df$symbol) & expr_geo_df$symbol != "", ]
+
+# Collapse duplicates
+library(dplyr)
+
+expr_geo_collapsed <- expr_geo_df %>%
+  group_by(symbol) %>%
+  summarise(across(where(is.numeric), mean), .groups = "drop")
+
+# Convert to matrix
+expr_geo_mat <- as.data.frame(expr_geo_collapsed)
+rownames(expr_geo_mat) <- expr_geo_mat$symbol
+expr_geo_mat$symbol <- NULL
+
+expr_geo_mat <- as.matrix(expr_geo_mat)
+
+cat("After collapsing GEO matrix:", dim(expr_geo_mat), "\n")
+
+############################
+# 4. Log transform if needed
+############################
+
+# GEO is usually already log2 — check range
+summary_vals <- summary(as.vector(expr_geo_mat))
+print(summary_vals)
+
+if (max(expr_geo_mat, na.rm = TRUE) > 50) {
+  expr_geo_mat <- log2(expr_geo_mat + 1)
+  cat("Applied log2 transform to GEO\n")
+}
+
+############################
+# 5. Build risk score
+############################
+
+sig_genes <- intersect(signature_custom$gene, rownames(expr_geo_mat))
+
+cat("Signature genes found in GEO:", length(sig_genes), "\n")
+
+X_geo <- t(expr_geo_mat[sig_genes, , drop = FALSE])
+
+coef_df <- signature_custom[match(colnames(X_geo), signature_custom$gene), ]
+beta_geo <- coef_df$coef
+
+risk_geo <- as.numeric(X_geo %*% beta_geo)
+
+############################
+# 6. Prepare survival data
+############################
+
+gse_df <- as.data.frame(gse_data)
+
+# Use OS columns already created earlier
+gse_df$time <- as.numeric(gse_df$os_time_months) * 30   # months → days
+gse_df$status <- as.numeric(gse_df$os_event)
+
+# Match samples
+common_samples <- intersect(rownames(X_geo), gse_df$sample)
+
+cat("Matched GEO samples:", length(common_samples), "\n")
+
+gse_df_match <- gse_df[gse_df$sample %in% common_samples, ]
+
+# Reorder expression
+X_geo <- X_geo[match(gse_df_match$sample, rownames(X_geo)), ]
+
+# Add risk score
+gse_df_match$risk_score <- as.numeric(X_geo %*% beta_geo)
+
+# Split groups
+median_cut <- median(gse_df_match$risk_score, na.rm = TRUE)
+
+gse_df_match$risk_group <- ifelse(
+  gse_df_match$risk_score >= median_cut,
+  "High", "Low"
+)
+
+cat("Risk group distribution (GEO):\n")
+print(table(gse_df_match$risk_group))
+
+############################
+# 7. Kaplan-Meier validation
+############################
+
+fit_geo <- survfit(Surv(time, status) ~ risk_group, data = gse_df_match)
+
+p_geo <- ggsurvplot(
+  fit_geo,
+  data = gse_df_match,
+  pval = TRUE,
+  risk.table = TRUE,
+  title = "GSE39582 Validation",
+  palette = c("#E74C3C", "#2ECC71")
+)
+
+print(p_geo)
+
+############################
+# 8. Save
+############################
+
+write.csv(gse_df_match,
+          file.path(root_dir, "results", "gse_validation_results.csv"),
+          row.names = FALSE)
+
+cat("✅ GEO validation complete\n")
+```
+```{r}
+# Load matrices
+tcga_expr <- readRDS(file.path(root_dir, "results", "crc_tpm_log_gene_matched.rds"))
+
+geo_eset <- readRDS(geo_eset_file)
+expr_geo <- exprs(geo_eset)
+fdata <- fData(geo_eset)
+
+# Extract GEO symbols again
+symbol_col <- colnames(fdata)[grepl("symbol", colnames(fdata), ignore.case = TRUE)][1]
+gene_symbols <- fdata[[symbol_col]]
+
+# Build GEO symbol matrix (same as before)
+expr_geo_df <- as.data.frame(expr_geo)
+expr_geo_df$symbol <- gene_symbols
+
+expr_geo_df <- expr_geo_df[!is.na(expr_geo_df$symbol) & expr_geo_df$symbol != "", ]
+
+library(dplyr)
+
+expr_geo_collapsed <- expr_geo_df %>%
+  group_by(symbol) %>%
+  summarise(across(where(is.numeric), mean), .groups = "drop")
+
+expr_geo_mat <- as.data.frame(expr_geo_collapsed)
+rownames(expr_geo_mat) <- expr_geo_mat$symbol
+expr_geo_mat$symbol <- NULL
+expr_geo_mat <- as.matrix(expr_geo_mat)
+
+############################
+# Find common genes
+############################
+
+common_genes <- intersect(rownames(tcga_expr), rownames(expr_geo_mat))
+
+cat("TCGA genes:", nrow(tcga_expr), "\n")
+cat("GEO genes:", nrow(expr_geo_mat), "\n")
+cat("Common genes:", length(common_genes), "\n")
+
+# Save
+saveRDS(common_genes, file.path(root_dir, "results", "common_genes_tcga_geo.rds"))
+```
+```{r}
+# Load data
+common_genes <- readRDS(file.path(root_dir, "results", "common_genes_tcga_geo.rds"))
+tcga_expr <- readRDS(file.path(root_dir, "results", "crc_tpm_log_gene_matched.rds"))
+surv_df2_match <- readRDS(file.path(root_dir, "results", "surv_df2_matched.rds"))
+de_sym <- read.csv(de_symbols_file, stringsAsFactors = FALSE)
+
+############################
+# 1. Restrict to common genes
+############################
+
+tcga_expr_common <- tcga_expr[intersect(rownames(tcga_expr), common_genes), ]
+
+cat("TCGA matrix after common gene filter:", dim(tcga_expr_common), "\n")
+
+############################
+# 2. Apply DE filter again
+############################
+
+sig_genes <- unique(
+  na.omit(de_sym$symbol[de_sym$adj.P.Val < 0.01 & abs(de_sym$logFC) > 1.5])
+)
+
+genes_for_cox <- intersect(sig_genes, rownames(tcga_expr_common))
+
+cat("Strict genes after common filter:", length(genes_for_cox), "\n")
+
+############################
+# 3. Build Cox matrix
+############################
+
+X <- t(tcga_expr_common[genes_for_cox, , drop = FALSE])
+X <- as.matrix(X)
+
+y <- Surv(surv_df2_match$time, surv_df2_match$status)
+
+cat("Cox matrix dim:", dim(X), "\n")
+
+############################
+# 4. Univariate Cox
+############################
+
+cox_p <- apply(X, 2, function(x) {
+  fit <- tryCatch(coxph(y ~ x), error = function(e) NULL)
+  if (is.null(fit)) return(NA_real_)
+  summary(fit)$coef[1, "Pr(>|z|)"]
+})
+
+cox_res <- data.frame(
+  gene = names(cox_p),
+  p = as.numeric(cox_p),
+  stringsAsFactors = FALSE
+)
+
+cox_res <- cox_res[!is.na(cox_res$p), ]
+cox_res <- cox_res[order(cox_res$p), ]
+
+cat("Top genes after refit:\n")
+print(head(cox_res, 10))
+
+############################
+# 5. LASSO (top 300)
+############################
+
+topN <- min(300, nrow(cox_res))
+lasso_genes <- head(cox_res$gene, topN)
+
+X_lasso <- X[, lasso_genes, drop = FALSE]
+
+set.seed(1)
+cvfit <- cv.glmnet(
+  x = X_lasso,
+  y = y,
+  family = "cox",
+  alpha = 1,
+  nfolds = 10
+)
+
+############################
+# 6. Select ~10–15 genes
+############################
+
+beta <- as.matrix(coef(cvfit$glmnet.fit))
+n_genes <- colSums(beta != 0)
+
+target <- 10   # slightly smaller improves generalization
+idx <- which.min(abs(n_genes - target))
+
+cat("Selected gene count:", n_genes[idx], "\n")
+
+coef_custom <- coef(cvfit$glmnet.fit, s = cvfit$glmnet.fit$lambda[idx])
+
+nz <- which(as.numeric(coef_custom) != 0)
+
+signature_new <- data.frame(
+  gene = rownames(coef_custom)[nz],
+  coef = as.numeric(coef_custom)[nz],
+  stringsAsFactors = FALSE
+)
+
+signature_new <- signature_new[order(-abs(signature_new$coef)), ]
+
+############################
+# 7. Save
+############################
+
+write.csv(signature_new,
+          file.path(root_dir, "results", "signature_refit_common.csv"),
+          row.names = FALSE)
+
+saveRDS(signature_new,
+        file.path(root_dir, "results", "signature_refit_common.rds"))
+
+cat("Final refit signature size:", nrow(signature_new), "\n")
+print(signature_new)
+```
+```{r}
+# Load refit signature
+signature_new <- readRDS(file.path(root_dir, "results", "signature_refit_common.rds"))
+
+# Load GEO expression + clinical
+geo_eset <- readRDS(geo_eset_file)
+gse_data <- readRDS(gse_validation_rds_file)
+
+expr_geo <- exprs(geo_eset)
+fdata <- fData(geo_eset)
+
+# Recover gene symbols
+symbol_col <- colnames(fdata)[grepl("symbol", colnames(fdata), ignore.case = TRUE)][1]
+gene_symbols <- fdata[[symbol_col]]
+
+# Build GEO symbol matrix
+expr_geo_df <- as.data.frame(expr_geo)
+expr_geo_df$symbol <- gene_symbols
+expr_geo_df <- expr_geo_df[!is.na(expr_geo_df$symbol) & expr_geo_df$symbol != "", ]
+
+library(dplyr)
+
+expr_geo_collapsed <- expr_geo_df %>%
+  group_by(symbol) %>%
+  summarise(across(where(is.numeric), mean), .groups = "drop")
+
+expr_geo_mat <- as.data.frame(expr_geo_collapsed)
+rownames(expr_geo_mat) <- expr_geo_mat$symbol
+expr_geo_mat$symbol <- NULL
+expr_geo_mat <- as.matrix(expr_geo_mat)
+
+# GEO appears already log-scaled; no transform unless huge values
+if (max(expr_geo_mat, na.rm = TRUE) > 50) {
+  expr_geo_mat <- log2(expr_geo_mat + 1)
+  cat("Applied log2 transform to GEO\n")
+}
+
+# Keep signature genes present in GEO
+sig_genes <- intersect(signature_new$gene, rownames(expr_geo_mat))
+cat("Refit signature genes found in GEO:", length(sig_genes), "\n")
+print(sig_genes)
+
+# Build GEO score matrix
+X_geo <- t(expr_geo_mat[sig_genes, , drop = FALSE])
+X_geo <- as.matrix(X_geo)
+
+coef_df <- signature_new[match(colnames(X_geo), signature_new$gene), , drop = FALSE]
+beta_geo <- coef_df$coef
+
+# Clinical data
+gse_df <- as.data.frame(gse_data)
+gse_df$time <- as.numeric(gse_df$os_time_months) * 30
+gse_df$status <- as.numeric(gse_df$os_event)
+
+# Match samples
+common_samples <- intersect(rownames(X_geo), gse_df$sample)
+cat("Matched GEO samples:", length(common_samples), "\n")
+
+gse_df_match <- gse_df[gse_df$sample %in% common_samples, ]
+gse_df_match <- gse_df_match[!is.na(gse_df_match$time) & !is.na(gse_df_match$status), ]
+gse_df_match <- gse_df_match[gse_df_match$time > 0, ]
+gse_df_match <- gse_df_match[!duplicated(gse_df_match$sample), ]
+
+# Reorder X_geo to clinical order
+X_geo <- X_geo[match(gse_df_match$sample, rownames(X_geo)), , drop = FALSE]
+
+# Risk score
+gse_df_match$risk_score <- as.numeric(X_geo %*% beta_geo)
+
+# Use GEO median split
+median_cut <- median(gse_df_match$risk_score, na.rm = TRUE)
+gse_df_match$risk_group <- ifelse(gse_df_match$risk_score >= median_cut, "High", "Low")
+
+cat("Risk group distribution (GEO refit):\n")
+print(table(gse_df_match$risk_group))
+
+# KM plot
+fit_geo <- survfit(Surv(time, status) ~ risk_group, data = gse_df_match)
+
+p_geo <- ggsurvplot(
+  fit_geo,
+  data = gse_df_match,
+  pval = TRUE,
+  risk.table = TRUE,
+  title = "GSE39582 Validation (Refit Common-Gene Signature)",
+  palette = c("#E74C3C", "#2ECC71")
+)
+
+print(p_geo)
+
+# Save
+write.csv(gse_df_match,
+          file.path(root_dir, "results", "gse_validation_refit_common.csv"),
+          row.names = FALSE)
+
+saveRDS(gse_df_match,
+        file.path(root_dir, "results", "gse_validation_refit_common.rds"))
+
+cat("✅ Refit GEO validation complete\n")
+```
+```{r}
+# Load data
+common_genes <- readRDS(file.path(root_dir, "results", "common_genes_tcga_geo.rds"))
+tcga_expr <- readRDS(file.path(root_dir, "results", "crc_tpm_log_gene_matched.rds"))
+surv_df2_match <- readRDS(file.path(root_dir, "results", "surv_df2_matched.rds"))
+de_sym <- read.csv(de_symbols_file, stringsAsFactors = FALSE)
+
+# Restrict TCGA to common genes
+tcga_expr_common <- tcga_expr[intersect(rownames(tcga_expr), common_genes), , drop = FALSE]
+
+# Strict DE genes that are also common
+sig_genes <- unique(
+  na.omit(de_sym$symbol[de_sym$adj.P.Val < 0.01 & abs(de_sym$logFC) > 1.5])
+)
+genes_for_cox <- intersect(sig_genes, rownames(tcga_expr_common))
+
+cat("Strict common genes:", length(genes_for_cox), "\n")
+
+# Cox matrix
+X <- t(tcga_expr_common[genes_for_cox, , drop = FALSE])
+X <- as.matrix(X)
+
+# Remove zero variance just in case
+sdv <- apply(X, 2, sd, na.rm = TRUE)
+X <- X[, sdv > 0, drop = FALSE]
+
+cat("Cox matrix dim:", dim(X), "\n")
+
+y <- Surv(surv_df2_match$time, surv_df2_match$status)
+
+# Univariate Cox ranking
+cox_p <- apply(X, 2, function(x) {
+  fit <- tryCatch(coxph(y ~ x), error = function(e) NULL)
+  if (is.null(fit)) return(NA_real_)
+  summary(fit)$coef[1, "Pr(>|z|)"]
+})
+
+cox_res <- data.frame(
+  gene = names(cox_p),
+  p = as.numeric(cox_p),
+  stringsAsFactors = FALSE
+)
+cox_res <- cox_res[!is.na(cox_res$p), ]
+cox_res <- cox_res[order(cox_res$p), ]
+
+cat("Top univariate genes:\n")
+print(head(cox_res, 15))
+
+# Use a tighter prefilter for robustness
+topN <- min(100, nrow(cox_res))
+lasso_genes <- head(cox_res$gene, topN)
+X_lasso <- X[, lasso_genes, drop = FALSE]
+
+cat("Genes entering robust LASSO:", ncol(X_lasso), "\n")
+
+# Fit LASSO
+set.seed(1)
+cvfit_small <- cv.glmnet(
+  x = X_lasso,
+  y = y,
+  family = "cox",
+  alpha = 1,
+  nfolds = 10
+)
+
+# Examine gene counts across lambdas
+beta <- as.matrix(coef(cvfit_small$glmnet.fit))
+n_genes <- colSums(beta != 0)
+
+cat("Gene counts across lambdas:\n")
+print(table(n_genes))
+
+# Target 6 genes
+target <- 6
+idx <- which.min(abs(n_genes - target))
+
+cat("Selected gene count:", n_genes[idx], "\n")
+
+coef_small <- coef(cvfit_small$glmnet.fit, s = cvfit_small$glmnet.fit$lambda[idx])
+nz <- which(as.numeric(coef_small) != 0)
+
+signature_small <- data.frame(
+  gene = rownames(coef_small)[nz],
+  coef = as.numeric(coef_small)[nz],
+  stringsAsFactors = FALSE
+)
+signature_small <- signature_small[order(-abs(signature_small$coef)), ]
+
+cat("Final small signature size:", nrow(signature_small), "\n")
+print(signature_small)
+
+# Save
+write.csv(signature_small,
+          file.path(root_dir, "results", "signature_small_robust.csv"),
+          row.names = FALSE)
+saveRDS(signature_small,
+        file.path(root_dir, "results", "signature_small_robust.rds"))
+saveRDS(cvfit_small,
+        file.path(root_dir, "results", "cvfit_small_robust.rds"))
+
+cat("✅ Small robust signature ready\n")
+```
+```{r}
+# Load small signature
+signature_small <- readRDS(file.path(root_dir, "results", "signature_small_robust.rds"))
+
+# Load GEO
+geo_eset <- readRDS(geo_eset_file)
+gse_data <- readRDS(gse_validation_rds_file)
+
+expr_geo <- exprs(geo_eset)
+fdata <- fData(geo_eset)
+
+# Get symbols
+symbol_col <- colnames(fdata)[grepl("symbol", colnames(fdata), ignore.case = TRUE)][1]
+gene_symbols <- fdata[[symbol_col]]
+
+# Build GEO matrix
+expr_geo_df <- as.data.frame(expr_geo)
+expr_geo_df$symbol <- gene_symbols
+expr_geo_df <- expr_geo_df[!is.na(expr_geo_df$symbol) & expr_geo_df$symbol != "", ]
+
+library(dplyr)
+
+expr_geo_collapsed <- expr_geo_df %>%
+  group_by(symbol) %>%
+  summarise(across(where(is.numeric), mean), .groups = "drop")
+
+expr_geo_mat <- as.data.frame(expr_geo_collapsed)
+rownames(expr_geo_mat) <- expr_geo_mat$symbol
+expr_geo_mat$symbol <- NULL
+expr_geo_mat <- as.matrix(expr_geo_mat)
+
+############################
+# Build risk score
+############################
+
+sig_genes <- intersect(signature_small$gene, rownames(expr_geo_mat))
+
+cat("Small signature genes in GEO:", length(sig_genes), "\n")
+print(sig_genes)
+
+X_geo <- t(expr_geo_mat[sig_genes, , drop = FALSE])
+
+coef_df <- signature_small[match(colnames(X_geo), signature_small$gene), ]
+beta_geo <- coef_df$coef
+
+risk_geo <- as.numeric(X_geo %*% beta_geo)
+
+############################
+# Survival data
+############################
+
+gse_df <- as.data.frame(gse_data)
+gse_df$time <- as.numeric(gse_df$os_time_months) * 30
+gse_df$status <- as.numeric(gse_df$os_event)
+
+common_samples <- intersect(rownames(X_geo), gse_df$sample)
+
+gse_df_match <- gse_df[gse_df$sample %in% common_samples, ]
+X_geo <- X_geo[match(gse_df_match$sample, rownames(X_geo)), ]
+
+gse_df_match$risk_score <- as.numeric(X_geo %*% beta_geo)
+
+# Median split
+median_cut <- median(gse_df_match$risk_score, na.rm = TRUE)
+
+gse_df_match$risk_group <- ifelse(
+  gse_df_match$risk_score >= median_cut,
+  "High", "Low"
+)
+
+cat("Risk group distribution:\n")
+print(table(gse_df_match$risk_group))
+
+############################
+# KM plot
+############################
+
+fit_geo <- survfit(Surv(time, status) ~ risk_group, data = gse_df_match)
+
+p_geo <- ggsurvplot(
+  fit_geo,
+  data = gse_df_match,
+  pval = TRUE,
+  risk.table = TRUE,
+  title = "GSE39582 Validation (6-Gene Robust Signature)",
+  palette = c("#E74C3C", "#2ECC71")
+)
+
+print(p_geo)
+
+cat("✅ Small model validation complete\n")
+```
+```{r}
+# Load GEO data
+geo_eset <- readRDS(geo_eset_file)
+gse_data <- readRDS(gse_validation_rds_file)
+
+############################
+# 1. Expression matrix
+############################
+
+expr_geo <- exprs(geo_eset)
+fdata <- fData(geo_eset)
+
+cat("Raw GEO matrix:", dim(expr_geo), "\n")
+
+############################
+# 2. Extract gene symbols
+############################
+
+symbol_col <- colnames(fdata)[grepl("symbol", colnames(fdata), ignore.case = TRUE)][1]
+gene_symbols <- fdata[[symbol_col]]
+
+cat("Using symbol column:", symbol_col, "\n")
+
+############################
+# 3. Build symbol matrix
+############################
+
+expr_geo_df <- as.data.frame(expr_geo)
+expr_geo_df$symbol <- gene_symbols
+
+expr_geo_df <- expr_geo_df[!is.na(expr_geo_df$symbol) & expr_geo_df$symbol != "", ]
+
+library(dplyr)
+
+expr_geo_collapsed <- expr_geo_df %>%
+  group_by(symbol) %>%
+  summarise(across(where(is.numeric), mean), .groups = "drop")
+
+expr_geo_mat <- as.data.frame(expr_geo_collapsed)
+rownames(expr_geo_mat) <- expr_geo_mat$symbol
+expr_geo_mat$symbol <- NULL
+expr_geo_mat <- as.matrix(expr_geo_mat)
+
+cat("Collapsed GEO matrix:", dim(expr_geo_mat), "\n")
+
+############################
+# 4. Prepare survival
+############################
+
+gse_df <- as.data.frame(gse_data)
+
+gse_df$sample <- as.character(gse_df$sample)
+gse_df$time <- as.numeric(gse_df$os_time_months) * 30
+gse_df$status <- as.numeric(gse_df$os_event)
+
+# Clean
+gse_df <- gse_df[!is.na(gse_df$sample) & !is.na(gse_df$time) & !is.na(gse_df$status), ]
+gse_df <- gse_df[gse_df$time > 0, ]
+gse_df <- gse_df[!duplicated(gse_df$sample), ]
+
+cat("GEO survival samples:", nrow(gse_df), "\n")
+
+############################
+# 5. Match samples
+############################
+
+common_samples <- intersect(colnames(expr_geo_mat), gse_df$sample)
+
+cat("Matched GEO samples:", length(common_samples), "\n")
+
+expr_geo_mat <- expr_geo_mat[, common_samples, drop = FALSE]
+gse_df <- gse_df[gse_df$sample %in% common_samples, ]
+
+# Reorder
+expr_geo_mat <- expr_geo_mat[, match(gse_df$sample, colnames(expr_geo_mat))]
+
+############################
+# 6. Final objects
+############################
+
+X_geo_all <- t(expr_geo_mat)
+X_geo_all <- as.matrix(X_geo_all)
+
+y_geo <- Surv(gse_df$time, gse_df$status)
+
+cat("Final GEO Cox matrix:", dim(X_geo_all), "\n")
+
+# Save
+saveRDS(X_geo_all, file.path(root_dir, "results", "X_geo_all.rds"))
+saveRDS(y_geo, file.path(root_dir, "results", "y_geo.rds"))
+
+cat("✅ GEO training data ready\n")
+```
+```{r}
+# Load GEO Cox data
+X_geo_all <- readRDS(file.path(root_dir, "results", "X_geo_all.rds"))
+y_geo <- readRDS(file.path(root_dir, "results", "y_geo.rds"))
+
+cat("Running GEO univariate Cox on", ncol(X_geo_all), "genes...\n")
+
+############################
+# Univariate Cox
+############################
+
+cox_p <- apply(X_geo_all, 2, function(x) {
+  fit <- tryCatch(coxph(y_geo ~ x), error = function(e) NULL)
+  if (is.null(fit)) return(NA_real_)
+  summary(fit)$coef[1, "Pr(>|z|)"]
+})
+
+cox_res_geo <- data.frame(
+  gene = colnames(X_geo_all),
+  p = as.numeric(cox_p),
+  stringsAsFactors = FALSE
+)
+
+cox_res_geo <- cox_res_geo[!is.na(cox_res_geo$p), ]
+cox_res_geo <- cox_res_geo[order(cox_res_geo$p), ]
+
+############################
+# Save
+############################
+
+write.csv(cox_res_geo,
+          file.path(root_dir, "results", "cox_geo_ranked.csv"),
+          row.names = FALSE)
+
+saveRDS(cox_res_geo,
+        file.path(root_dir, "results", "cox_geo_ranked.rds"))
+
+############################
+# Show top genes
+############################
+
+cat("Top 15 GEO prognostic genes:\n")
+print(head(cox_res_geo, 15))
+
+cat("✅ GEO Cox complete\n")
+```
+```{r}
+# Load GEO Cox results
+cox_res_geo <- readRDS(file.path(root_dir, "results", "cox_geo_ranked.rds"))
+X_geo_all <- readRDS(file.path(root_dir, "results", "X_geo_all.rds"))
+y_geo <- readRDS(file.path(root_dir, "results", "y_geo.rds"))
+
+############################
+# 1. Select top genes
+############################
+
+topN <- 200   # smaller = more robust
+lasso_genes <- head(cox_res_geo$gene, topN)
+
+X_lasso <- X_geo_all[, lasso_genes, drop = FALSE]
+
+cat("Genes entering GEO LASSO:", ncol(X_lasso), "\n")
+
+############################
+# 2. Fit LASSO Cox
+############################
+
+set.seed(1)
+
+cvfit_geo <- cv.glmnet(
+  x = X_lasso,
+  y = y_geo,
+  family = "cox",
+  alpha = 1,
+  nfolds = 10
+)
+
+############################
+# 3. Check gene counts
+############################
+
+beta <- as.matrix(coef(cvfit_geo$glmnet.fit))
+n_genes <- colSums(beta != 0)
+
+cat("Gene counts across lambdas:\n")
+print(table(n_genes))
+
+############################
+# 4. Select small signature
+############################
+
+target <- 6
+idx <- which.min(abs(n_genes - target))
+
+cat("Selected gene count:", n_genes[idx], "\n")
+
+coef_geo <- coef(cvfit_geo$glmnet.fit, s = cvfit_geo$glmnet.fit$lambda[idx])
+
+nz <- which(as.numeric(coef_geo) != 0)
+
+signature_geo <- data.frame(
+  gene = rownames(coef_geo)[nz],
+  coef = as.numeric(coef_geo)[nz],
+  stringsAsFactors = FALSE
+)
+
+signature_geo <- signature_geo[order(-abs(signature_geo$coef)), ]
+
+############################
+# 5. Save
+############################
+
+write.csv(signature_geo,
+          file.path(root_dir, "results", "signature_geo_trained.csv"),
+          row.names = FALSE)
+
+saveRDS(signature_geo,
+        file.path(root_dir, "results", "signature_geo_trained.rds"))
+
+cat("Final GEO-trained signature size:", nrow(signature_geo), "\n")
+print(signature_geo)
+
+cat("✅ GEO LASSO complete\n")
+```
+
+```{r}
+# Load GEO-trained signature
+signature_geo <- readRDS(file.path(root_dir, "results", "signature_geo_trained.rds"))
+
+# Load TCGA data
+expr_tcga <- readRDS(file.path(root_dir, "results", "crc_tpm_log_gene_matched.rds"))
+surv_tcga <- readRDS(file.path(root_dir, "results", "surv_df2_matched.rds"))
+
+############################
+# 1. Check genes in TCGA
+############################
+
+sig_genes <- intersect(signature_geo$gene, rownames(expr_tcga))
+
+cat("GEO signature genes found in TCGA:", length(sig_genes), "\n")
+print(sig_genes)
+
+############################
+# 2. Build risk score
+############################
+
+X_tcga <- t(expr_tcga[sig_genes, , drop = FALSE])
+
+coef_df <- signature_geo[match(colnames(X_tcga), signature_geo$gene), ]
+beta_tcga <- coef_df$coef
+
+risk_tcga <- as.numeric(X_tcga %*% beta_tcga)
+
+############################
+# 3. Add to survival
+############################
+
+surv_tcga$risk_score <- risk_tcga
+
+median_cut <- median(surv_tcga$risk_score, na.rm = TRUE)
+
+surv_tcga$risk_group <- ifelse(
+  surv_tcga$risk_score >= median_cut,
+  "High", "Low"
+)
+
+cat("TCGA risk group distribution:\n")
+print(table(surv_tcga$risk_group))
+
+############################
+# 4. Kaplan-Meier
+############################
+
+fit_tcga <- survfit(Surv(time, status) ~ risk_group, data = surv_tcga)
+
+p_tcga <- ggsurvplot(
+  fit_tcga,
+  data = surv_tcga,
+  pval = TRUE,
+  risk.table = TRUE,
+  title = "TCGA Validation (GEO-trained 5-Gene Signature)",
+  palette = c("#E74C3C", "#2ECC71")
+)
+
+print(p_tcga)
+
+############################
+# 5. Save
+############################
+
+write.csv(surv_tcga,
+          file.path(root_dir, "results", "tcga_validation_geo_model.csv"),
+          row.names = FALSE)
+
+cat("✅ TCGA validation complete\n")
+```
+```{r}
+# Use the validated TCGA dataset from the GEO-trained model
+tcga_val <- read.csv(
+  file.path(root_dir, "results", "tcga_validation_geo_model.csv"),
+  stringsAsFactors = FALSE
+)
+
+# Order by risk score
+tcga_val <- tcga_val[order(tcga_val$risk_score), ]
+tcga_val$index <- seq_len(nrow(tcga_val))
+
+cat("TCGA validation data dim:", dim(tcga_val), "\n")
+print(head(tcga_val))
+
+library(ggplot2)
+
+# 1) Risk score distribution
+p1 <- ggplot(tcga_val, aes(x = index, y = risk_score, color = risk_group)) +
+  geom_point() +
+  labs(
+    title = "TCGA Risk Score Distribution",
+    x = "Patients (ordered by risk score)",
+    y = "Risk score"
+  ) +
+  theme_bw()
+
+print(p1)
+
+# 2) Survival status scatter
+p2 <- ggplot(tcga_val, aes(x = index, y = time, color = factor(status))) +
+  geom_point() +
+  labs(
+    title = "TCGA Survival Status Distribution",
+    x = "Patients (ordered by risk score)",
+    y = "Survival time",
+    color = "Status"
+  ) +
+  theme_bw()
+
+print(p2)
+
+# Save
+ggsave(
+  file.path(root_dir, "figures", "TCGA_risk_score_distribution.png"),
+  plot = p1, width = 8, height = 5, dpi = 300
+)
+
+ggsave(
+  file.path(root_dir, "figures", "TCGA_survival_status_distribution.png"),
+  plot = p2, width = 8, height = 5, dpi = 300
+)
+
+cat("✅ Risk score plots complete\n")
+```
+```{r}
+# Install if needed
+# install.packages("timeROC")
+
+library(timeROC)
+
+# Load TCGA validation data
+tcga_val <- read.csv(
+  file.path(root_dir, "results", "tcga_validation_geo_model.csv"),
+  stringsAsFactors = FALSE
+)
+
+############################
+# Time-dependent ROC
+############################
+
+# Choose time points (1, 3, 5 years in days)
+times <- c(365, 1095, 1825)
+
+roc_res <- timeROC(
+  T = tcga_val$time,
+  delta = tcga_val$status,
+  marker = tcga_val$risk_score,
+  cause = 1,
+  times = times,
+  iid = TRUE
+)
+
+############################
+# Plot ROC curves
+############################
+
+plot(roc_res, time = 365, col = "red", title = FALSE)
+plot(roc_res, time = 1095, col = "blue", add = TRUE)
+plot(roc_res, time = 1825, col = "green", add = TRUE)
+
+legend(
+  "bottomright",
+  legend = c(
+    paste0("1-year AUC = ", round(roc_res$AUC[1], 3)),
+    paste0("3-year AUC = ", round(roc_res$AUC[2], 3)),
+    paste0("5-year AUC = ", round(roc_res$AUC[3], 3))
+  ),
+  col = c("red", "blue", "green"),
+  lwd = 2
+)
+
+############################
+# Print AUC values
+############################
+
+cat("AUC values:\n")
+print(roc_res$AUC)
+
+cat("✅ ROC analysis complete\n")
+```
+```{r}
+tcga_val <- read.csv(
+  file.path(root_dir, "results", "tcga_validation_geo_model.csv"),
+  stringsAsFactors = FALSE
+)
+
+cat("TCGA validation columns:\n")
+print(colnames(tcga_val))
+
+cat("\nDimensions:\n")
+print(dim(tcga_val))
+
+cat("\nFirst rows:\n")
+print(head(tcga_val))
+```
+
+```{r}
+library(TCGAbiolinks)
+
+clinical <- GDCquery_clinic(
+  project = "TCGA-COAD",
+  type = "clinical"
+)
+
+cat("Clinical data dim:", dim(clinical), "\n")
+print(colnames(clinical))
+
+# Look for stage column
+stage_cols <- colnames(clinical)[grepl("stage", colnames(clinical), ignore.case = TRUE)]
+
+cat("\nPossible stage columns:\n")
+print(stage_cols)
+
+# Show example
+print(head(clinical[, stage_cols], 10))
+```
+```{r}
+# Load validation data
+tcga_val <- read.csv(
+  file.path(root_dir, "results", "tcga_validation_geo_model.csv"),
+  stringsAsFactors = FALSE
+)
+
+# clinical already loaded in your session from GDCquery_clinic()
+# If needed, uncomment:
+# clinical <- GDCquery_clinic(project = "TCGA-COAD", type = "clinical")
+
+# Keep only patient barcode + stage
+clinical_stage <- clinical[, c("bcr_patient_barcode", "ajcc_pathologic_stage")]
+clinical_stage <- clinical_stage[!is.na(clinical_stage$ajcc_pathologic_stage) &
+                                   clinical_stage$ajcc_pathologic_stage != "", ]
+clinical_stage <- clinical_stage[!duplicated(clinical_stage$bcr_patient_barcode), ]
+
+colnames(clinical_stage) <- c("patient", "stage")
+
+cat("Clinical stage table dim:", dim(clinical_stage), "\n")
+print(head(clinical_stage, 10))
+
+# Merge into validation dataset by patient barcode
+tcga_val2 <- merge(tcga_val, clinical_stage, by = "patient", all.x = TRUE)
+
+cat("Merged TCGA validation dim:", dim(tcga_val2), "\n")
+cat("Stage missing after merge:", sum(is.na(tcga_val2$stage)), "\n")
+
+# Keep rows with stage available
+tcga_val2 <- tcga_val2[!is.na(tcga_val2$stage) & tcga_val2$stage != "", ]
+
+cat("Rows after keeping stage:", nrow(tcga_val2), "\n")
+cat("Stage distribution:\n")
+print(table(tcga_val2$stage))
+
+# Basic cleanup
+tcga_val2$time <- as.numeric(tcga_val2$time)
+tcga_val2$status <- as.numeric(tcga_val2$status)
+tcga_val2$risk_score <- as.numeric(tcga_val2$risk_score)
+tcga_val2$stage <- as.factor(tcga_val2$stage)
+
+############################
+# Univariate Cox
+############################
+
+fit_uni <- coxph(Surv(time, status) ~ risk_score, data = tcga_val2)
+
+cat("\nUnivariate Cox:\n")
+print(summary(fit_uni))
+
+############################
+# Multivariate Cox
+############################
+
+fit_multi <- coxph(Surv(time, status) ~ risk_score + stage, data = tcga_val2)
+
+cat("\nMultivariate Cox:\n")
+print(summary(fit_multi))
+
+# Save
+saveRDS(tcga_val2, file.path(root_dir, "results", "tcga_validation_with_stage.rds"))
+saveRDS(fit_multi, file.path(root_dir, "results", "cox_multivariate_model.rds"))
+
+cat("✅ Multivariate Cox complete\n")
+```
+```{r}
+tcga_val2$stage_simple <- NA_character_
+
+# Order is IMPORTANT (longest first)
+tcga_val2$stage_simple[grepl("^Stage IV", tcga_val2$stage)] <- "Stage IV"
+tcga_val2$stage_simple[grepl("^Stage III", tcga_val2$stage)] <- "Stage III"
+tcga_val2$stage_simple[grepl("^Stage II", tcga_val2$stage)] <- "Stage II"
+tcga_val2$stage_simple[grepl("^Stage I($|[^I])", tcga_val2$stage)] <- "Stage I"
+
+tcga_val2$stage_simple <- factor(
+  tcga_val2$stage_simple,
+  levels = c("Stage I", "Stage II", "Stage III", "Stage IV")
+)
+
+table(tcga_val2$stage_simple)
+```
+```{r}
+# Convert factor to character first
+stage_chr <- as.character(tcga_val2$stage)
+
+tcga_val2$stage_simple <- ifelse(
+  stage_chr %in% c("Stage I", "Stage IA"),
+  "Stage I",
+  ifelse(
+    stage_chr %in% c("Stage II", "Stage IIA", "Stage IIB", "Stage IIC"),
+    "Stage II",
+    ifelse(
+      stage_chr %in% c("Stage III", "Stage IIIA", "Stage IIIB", "Stage IIIC"),
+      "Stage III",
+      ifelse(
+        stage_chr %in% c("Stage IV", "Stage IVA", "Stage IVB"),
+        "Stage IV",
+        NA
+      )
+    )
+  )
+)
+
+tcga_val2$stage_simple <- factor(
+  tcga_val2$stage_simple,
+  levels = c("Stage I", "Stage II", "Stage III", "Stage IV")
+)
+
+table(tcga_val2$stage_simple, useNA = "ifany")
+```
+
+```{r}
+fit_multi2 <- coxph(Surv(time, status) ~ risk_score + stage_simple, data = tcga_val2)
+summary(fit_multi2)
+```
+```{r}
+library(survival)
+library(ggplot2)
+library(dplyr)
+
+# Optional packages
+has_survminer <- requireNamespace("survminer", quietly = TRUE)
+has_forestmodel <- requireNamespace("forestmodel", quietly = TRUE)
+
+# Load TCGA data with collapsed stage
+tcga_val2 <- readRDS(file.path(root_dir, "results", "tcga_validation_with_stage.rds"))
+
+# Recreate collapsed stage if not already saved
+if (!"stage_simple" %in% colnames(tcga_val2)) {
+  stage_chr <- as.character(tcga_val2$stage)
+
+  tcga_val2$stage_simple <- ifelse(
+    stage_chr %in% c("Stage I", "Stage IA"),
+    "Stage I",
+    ifelse(
+      stage_chr %in% c("Stage II", "Stage IIA", "Stage IIB", "Stage IIC"),
+      "Stage II",
+      ifelse(
+        stage_chr %in% c("Stage III", "Stage IIIA", "Stage IIIB", "Stage IIIC"),
+        "Stage III",
+        ifelse(
+          stage_chr %in% c("Stage IV", "Stage IVA", "Stage IVB"),
+          "Stage IV",
+          NA
+        )
+      )
+    )
+  )
+
+  tcga_val2$stage_simple <- factor(
+    tcga_val2$stage_simple,
+    levels = c("Stage I", "Stage II", "Stage III", "Stage IV")
+  )
+}
+
+# Keep complete cases for the final model
+tcga_val2 <- tcga_val2 %>%
+  filter(!is.na(time), !is.na(status), !is.na(risk_score), !is.na(stage_simple))
+
+# Final corrected multivariate model
+fit_multi2 <- coxph(Surv(time, status) ~ risk_score + stage_simple, data = tcga_val2)
+
+# Save the corrected model
+saveRDS(fit_multi2, file.path(root_dir, "results", "cox_multivariate_model_stage_simple.rds"))
+
+cat("\nCorrected multivariate model summary:\n")
+print(summary(fit_multi2))
+```
+```{r}
+if (has_forestmodel) {
+  library(forestmodel)
+
+  forest_plot2 <- forest_model(fit_multi2)
+  print(forest_plot2)
+}
+# Extract coefficients
+coef_summary <- summary(fit_multi2)$coefficients
+confint_summary <- confint(fit_multi2)
+
+forest_data <- data.frame(
+  Variable = rownames(coef_summary),
+  HR = exp(coef_summary[, "coef"]),
+  CI_lower = exp(confint_summary[, 1]),
+  CI_upper = exp(confint_summary[, 2]),
+  P_value = coef_summary[, "Pr(>|z|)"],
+  stringsAsFactors = FALSE
+)
+
+# Clean variable names
+forest_data$Variable <- gsub("^risk_score$", "Risk score", forest_data$Variable)
+forest_data$Variable <- gsub("^stage_simpleStage II$", "Stage II vs I", forest_data$Variable)
+forest_data$Variable <- gsub("^stage_simpleStage III$", "Stage III vs I", forest_data$Variable)
+forest_data$Variable <- gsub("^stage_simpleStage IV$", "Stage IV vs I", forest_data$Variable)
+
+# Significance stars
+forest_data$Signif <- ifelse(
+  forest_data$P_value < 0.001, "***",
+  ifelse(
+    forest_data$P_value < 0.01, "**",
+    ifelse(forest_data$P_value < 0.05, "*", "")
+  )
+)
+
+# Label text
+forest_data$Label <- paste0(
+  sprintf("%.2f", forest_data$HR),
+  " (",
+  sprintf("%.2f", forest_data$CI_lower),
+  "–",
+  sprintf("%.2f", forest_data$CI_upper),
+  ") ",
+  forest_data$Signif
+)
+
+# Expand x-axis room for labels
+xmax <- max(forest_data$CI_upper, na.rm = TRUE) * 2
+
+p <- ggplot(forest_data, aes(x = HR, y = reorder(Variable, HR))) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+  geom_errorbarh(
+    aes(xmin = CI_lower, xmax = CI_upper),
+    height = 0.2,
+    linewidth = 0.8
+  ) +
+  geom_point(size = 3) +
+  scale_x_log10(limits = c(min(forest_data$CI_lower) * 0.8, xmax)) +
+  labs(
+    title = "Multivariate Cox Regression Analysis",
+    subtitle = "TCGA validation cohort",
+    x = "Hazard ratio (95% CI)",
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.y = element_text(size = 11),
+    axis.text.x = element_text(size = 10),
+    plot.title = element_text(size = 14, face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank()
+  ) +
+  geom_text(
+    aes(x = CI_upper * 1.15, label = Label),
+    hjust = 0,
+    size = 3.5
+  ) +
+  coord_cartesian(clip = "off")
+
+print(p)
+
+ggsave(
+  file.path(root_dir, "results", "forest_plot_manual_stage_simple.png"),
+  p,
+  width = 10, height = 5, dpi = 300
+)
+
+ggsave(
+  file.path(root_dir, "results", "forest_plot_manual_stage_simple.pdf"),
+  p,
+  width = 10, height = 5
+)
+
+cat("\n✅ Forest plot saved to results/\n")
+```
+
+```{r}
+stage23_data <- tcga_val2[tcga_val2$stage_simple %in% c("Stage II", "Stage III"), ]
+
+cat("Stage II+III samples:", nrow(stage23_data), "\n")
+table(stage23_data$stage_simple)
+```
+
+```{r}
+# Load the matched TCGA expression matrix
+expr_mat <- readRDS(file.path(root_dir, "results", "crc_tpm_log_gene_matched.rds"))
+
+cat("Expression matrix dim:\n")
+print(dim(expr_mat))
+
+cat("First 10 rownames:\n")
+print(head(rownames(expr_mat), 10))
+
+cat("First 10 colnames:\n")
+print(head(colnames(expr_mat), 10))
+```
+```{r}
+sig_genes <- c("PPFIA4", "NKAIN4", "RYR2", "XCL1", "C8G", "LRRN4")
+
+cat("Signature genes present:\n")
+print(intersect(sig_genes, rownames(expr_mat)))
+
+cat("Number of signature genes present:", length(intersect(sig_genes, rownames(expr_mat))), "\n")
+
+cat("First 10 tcga_val2$sample15 values:\n")
+print(head(tcga_val2$sample15, 10))
+
+common_samples <- intersect(colnames(expr_mat), tcga_val2$sample15)
+
+cat("Number of matched samples:", length(common_samples), "\n")
+print(head(common_samples, 10))
+```
+
+```{r}
+sig_present <- intersect(sig_genes, rownames(expr_mat))
+common_samples <- intersect(colnames(expr_mat), tcga_val2$sample15)
+
+expr_sig <- expr_mat[sig_present, common_samples, drop = FALSE]
+
+cat("Heatmap matrix dim before scaling:\n")
+print(dim(expr_sig))
+```
+```{r}
+library(pheatmap)
+
+sig_genes <- c("PPFIA4", "NKAIN4", "RYR2", "XCL1", "C8G", "LRRN4")
+
+# Genes present
+sig_present <- intersect(sig_genes, rownames(expr_mat))
+
+# Convert expression colnames to 15-char IDs
+expr_col15 <- substr(colnames(expr_mat), 1, 15)
+
+# Match samples
+common_samples15 <- intersect(expr_col15, tcga_val2$sample15)
+
+cat("Matched samples using 15-char IDs:", length(common_samples15), "\n")
+
+# Keep matching expression columns
+expr_keep <- expr_col15 %in% common_samples15
+expr_sig <- expr_mat[sig_present, expr_keep, drop = FALSE]
+expr_sig_col15 <- substr(colnames(expr_sig), 1, 15)
+
+# Reorder columns to tcga_val2 order
+tcga_val2_sub <- tcga_val2[tcga_val2$sample15 %in% common_samples15, , drop = FALSE]
+tcga_val2_sub <- tcga_val2_sub[match(expr_sig_col15, tcga_val2_sub$sample15), , drop = FALSE]
+
+cat("Heatmap matrix dim before scaling:\n")
+print(dim(expr_sig))
+
+# Annotation
+annotation_col <- data.frame(Risk = tcga_val2_sub$risk_group)
+rownames(annotation_col) <- colnames(expr_sig)
+
+# Scale by gene
+expr_sig_scaled <- t(scale(t(expr_sig)))
+
+pheatmap(
+  expr_sig_scaled,
+  annotation_col = annotation_col,
+  show_colnames = FALSE,
+  main = "6-Gene Signature Expression Heatmap"
+)
+
+# Save
+png("results/heatmap_signature.png", width = 900, height = 650)
+pheatmap(
+  expr_sig_scaled,
+  annotation_col = annotation_col,
+  show_colnames = FALSE,
+  main = "6-Gene Signature Expression Heatmap"
+)
+dev.off()
+```
+
